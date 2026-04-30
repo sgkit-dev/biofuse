@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  merge_group:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install lint group
+        run: uv sync --only-group lint
+
+      - name: Run ruff check
+        run: uv run --only-group lint ruff check .
+
+      - name: Run ruff format check
+        run: uv run --only-group lint ruff format --check .
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check out vcztools (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: sgkit-dev/vcztools
+          path: ../vcztools
+          persist-credentials: false
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+              fuse3 libfuse3-dev pkg-config \
+              plink1.9 plink2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --group test
+
+      - name: Run tests with coverage
+        run: uv run pytest --cov=biofuse --cov-report=term-missing
+
+  packaging:
+    name: Packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install system packages
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev pkg-config
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install packaging deps
+        run: uv sync --group packaging --no-default-groups
+
+      - name: Validate pyproject
+        run: uv run validate-pyproject pyproject.toml -v
+
+      - name: Build artefacts
+        run: uv build
+
+      - name: Twine check
+        run: uv run twine check --strict dist/*
