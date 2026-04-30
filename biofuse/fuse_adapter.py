@@ -32,9 +32,15 @@ class BiofuseOperations(pyfuse3.Operations):
     enable_writeback_cache = False
     supports_dot_lookup = True
 
-    def __init__(self, view: view_mod.FilesystemView) -> None:
+    def __init__(
+        self,
+        view: view_mod.FilesystemView,
+        *,
+        direct_io: bool = False,
+    ) -> None:
         super().__init__()
         self._view = view
+        self._direct_io = direct_io
         self._uid = os.getuid()
         self._gid = os.getgid()
         self._lock = threading.Lock()
@@ -123,7 +129,7 @@ class BiofuseOperations(pyfuse3.Operations):
             fh = self._next_fh
             self._next_fh += 1
             self._fh_to_view_handle[fh] = view_fh
-        return pyfuse3.FileInfo(fh=fh)
+        return pyfuse3.FileInfo(fh=fh, direct_io=self._direct_io)
 
     async def read(self, fh, off, size):
         with self._lock:
@@ -176,11 +182,13 @@ class Mount:
         *,
         fsname: str = "biofuse",
         debug_fuse: bool = False,
+        direct_io: bool = False,
     ) -> None:
         self._view = view
         self._mountpoint = mountpoint
         self._fsname = fsname
         self._debug_fuse = debug_fuse
+        self._direct_io = direct_io
         self._thread: threading.Thread | None = None
         self._exception: BaseException | None = None
         self._ops: BiofuseOperations | None = None
@@ -193,7 +201,7 @@ class Mount:
                 "pyfuse3 supports only one mount at a time"
             )
         try:
-            self._ops = BiofuseOperations(self._view)
+            self._ops = BiofuseOperations(self._view, direct_io=self._direct_io)
             options = set(pyfuse3.default_options)
             options.add(f"fsname={self._fsname}")
             options.add("ro")

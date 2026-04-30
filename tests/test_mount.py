@@ -238,6 +238,71 @@ class TestAccessLogger:
         assert total == (fx_backing / "alpha.bed").stat().st_size
 
 
+class TestDirectIO:
+    """Mounts with direct_io=True should bypass the kernel page cache.
+
+    Every byte a consumer touches must surface through the access logger,
+    including bytes accessed via mmap (or mmap is refused, in which case
+    the consumer falls back to read() and we still see every byte).
+    """
+
+    def test_basic_read_still_works(self, tmp_path, fx_backing):
+        mnt = tmp_path / "mnt"
+        mnt.mkdir()
+        view = passthrough_view.PassthroughDirectoryView(fx_backing)
+        with fuse_adapter.Mount(view, str(mnt), direct_io=True):
+            _wait_for_mount(mnt)
+            assert (mnt / "alpha.bed").read_bytes() == (
+                fx_backing / "alpha.bed"
+            ).read_bytes()
+        view.close()
+
+    def test_mmap_reads_surface_through_access_log(self, tmp_path, fx_backing):
+        mnt = tmp_path / "mnt"
+        mnt.mkdir()
+        log = access_log.AccessLogger()
+        view = passthrough_view.PassthroughDirectoryView(
+            fx_backing, access_logger=log
+        )
+        original = (fx_backing / "alpha.bed").read_bytes()
+        with fuse_adapter.Mount(view, str(mnt), direct_io=True):
+            _wait_for_mount(mnt)
+            # Run mmap in a child process so the page-fault path is the
+            # same kernel codepath that a real consumer (e.g. bed-reader)
+            # would hit, and so a deadlock (FUSE thread blocked on its
+            # own page fault) cannot wedge the test runner.
+            script = (
+                "import mmap, sys\n"
+                "with open(sys.argv[1], 'rb') as f:\n"
+                "    try:\n"
+                "        mm = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ)\n"
+                "    except OSError as exc:\n"
+                "        sys.stdout.write(f'mmap-failed: {exc.errno}\\n')\n"
+                "        sys.exit(0)\n"
+                "    sys.stdout.write(f'mmap-ok: {mm[:].hex()}\\n')\n"
+                "    mm.close()\n"
+            )
+            result = subprocess.run(
+                ["python3", "-c", script, str(mnt / "alpha.bed")],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            )
+        view.close()
+        out = result.stdout.strip()
+        if out.startswith("mmap-failed"):
+            # mmap fully blocked is also acceptable — same outcome from
+            # biofuse's perspective: the consumer cannot evade the logger.
+            return
+        assert out.startswith("mmap-ok"), out
+        got_hex = out.split(": ", 1)[1]
+        assert bytes.fromhex(got_hex) == original
+        # Every byte the consumer "saw" must have come through FUSE.
+        bytes_logged = sum(r.size for r in log.records if r.path == "alpha.bed")
+        assert bytes_logged >= len(original)
+
+
 class TestMountLifecycle:
     def test_mountpoint_reports_fusefs_during_mount(self, fx_mount):
         mnt, _ = fx_mount

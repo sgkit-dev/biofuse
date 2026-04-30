@@ -163,6 +163,23 @@ class TestOpenReadRelease:
             run(fx_ops.release(info1.fh))
             run(fx_ops.release(info2.fh))
 
+    def test_open_default_no_direct_io(self, fx_ops):
+        inode = fx_ops._name_to_inode["alpha.bed"]
+        info = run(fx_ops.open(inode, os.O_RDONLY))
+        try:
+            assert info.direct_io is False
+        finally:
+            run(fx_ops.release(info.fh))
+
+    def test_open_with_direct_io_propagates_flag(self, fx_view):
+        ops = fuse_adapter.BiofuseOperations(fx_view, direct_io=True)
+        inode = ops._name_to_inode["alpha.bed"]
+        info = run(ops.open(inode, os.O_RDONLY))
+        try:
+            assert info.direct_io is True
+        finally:
+            run(ops.release(info.fh))
+
 
 class TestOpendir:
     def test_root(self, fx_ops):

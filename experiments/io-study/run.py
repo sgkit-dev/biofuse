@@ -2,9 +2,10 @@
 
 For each operation:
 1. Open a fresh AccessLogger writing JSONL to traces/<op_id>.jsonl.
-2. Mount the golden plink directory through pyfuse3 via biofuse.
+2. Mount the golden plink directory through pyfuse3 (kernel page cache
+   on; ``direct_io`` was tried and rejected — see report.md).
 3. Generate any requested aux files (extract lists, phenotype) once.
-4. Spawn the plink subprocess against the mount with a timeout.
+4. Spawn the consumer subprocess against the mount with a timeout.
 5. Unmount, close logger, append a row to results/summary.csv.
 
 Run with no arguments to skip ``expensive=True`` operations.
@@ -36,6 +37,9 @@ TRACES_DIR = HERE / "traces"
 RESULTS_DIR = HERE / "results"
 RUN_DIR = HERE / "_runtime"
 AUX_DIR = HERE / "_aux"
+TOOLS_DIR = HERE / "_tools"
+TOOLS_MANIFEST = TOOLS_DIR / "manifest.json"
+SCRIPTS_DIR = HERE / "scripts"
 
 logger = logging.getLogger(__name__)
 
@@ -77,8 +81,6 @@ def _read_fam_sample_ids() -> list[tuple[str, str]]:
 def _gen_extract_n(n: int):
     def _generator(out_path: pathlib.Path) -> None:
         ids = _read_bim_variant_ids()
-        # Use evenly-spaced IDs to span the whole .bed (avoids
-        # accidentally picking only the first few variants).
         if n >= len(ids):
             sample = ids
         else:
@@ -110,12 +112,23 @@ def _gen_pheno(out_path: pathlib.Path) -> None:
             f.write(f"{fid}\t{iid}\t{rng.gauss(0, 1):.6f}\n")
 
 
+def _gen_pheno_binary(out_path: pathlib.Path) -> None:
+    """Case/control phenotype for REGENIE/BOLT-LMM --bt; values in {0,1}."""
+    rng = random.Random(43)
+    rows = _read_fam_sample_ids()
+    with out_path.open("w") as f:
+        f.write("FID\tIID\tY1\n")
+        for fid, iid in rows:
+            f.write(f"{fid}\t{iid}\t{rng.randint(0, 1)}\n")
+
+
 AUX_GENERATORS = {
     "extract_10": _gen_extract_n(10),
     "extract_1k": _gen_extract_n(1_000),
     "extract_100k": _gen_extract_n(100_000),
     "keep_10": _gen_keep_n(10),
     "pheno": _gen_pheno,
+    "pheno_binary": _gen_pheno_binary,
 }
 
 
@@ -134,34 +147,92 @@ def _ensure_aux_files(names: tuple[str, ...]) -> dict[str, pathlib.Path]:
 
 
 # ---------------------------------------------------------------------------
+# Tool resolution
+# ---------------------------------------------------------------------------
+
+
+def _load_tools_manifest() -> dict[str, str]:
+    if not TOOLS_MANIFEST.exists():
+        return {}
+    return json.loads(TOOLS_MANIFEST.read_text())
+
+
+# Tools whose binary names differ from the logical tool name in operations.
+_PATH_FALLBACK_NAMES = {
+    "plink1.9": ("plink1.9", "plink19", "plink"),
+    "plink2": ("plink2",),
+    "admixture": ("admixture",),
+    "king": ("king",),
+    "gcta": ("gcta64", "gcta"),
+    "flashpca": ("flashpca",),
+    "regenie": ("regenie",),
+    "bolt": ("bolt",),
+    # Library wrappers run as `uv run python <runner>`.
+    "bedreader": ("bedreader",),
+}
+
+
+def _resolve_tool(name: str, manifest: dict[str, str]) -> str | None:
+    """Return an executable path for ``name`` or None if unavailable.
+
+    Precedence: ``_tools/manifest.json`` first, then ``$PATH`` over a small
+    set of conventional binary names.
+    """
+    if name in manifest:
+        return manifest[name]
+    for candidate in _PATH_FALLBACK_NAMES.get(name, (name,)):
+        path = shutil.which(candidate)
+        if path is not None:
+            return path
+    return None
+
+
+def _build_command(
+    op: operations_module.Operation,
+    *,
+    tool_path: str,
+    substitutions: dict[str, str],
+) -> list[str]:
+    """Render the op's argv template and prepend the tool/runner prefix.
+
+    Library-style ops (``tool='bedreader'``) have ``${runner}`` in argv;
+    we render it and run via ``uv run python <runner>`` so the script
+    picks up the project's environment.
+    """
+    rendered = [_render(arg, substitutions) for arg in op.argv]
+    if op.tool == "bedreader":
+        return ["uv", "run", "python", *rendered]
+    return [tool_path, *rendered]
+
+
+def _render(arg: str, substitutions: dict[str, str]) -> str:
+    """Substitute ``${name}`` and ``${aux:NAME}`` placeholders.
+
+    Implemented via ``string.Template`` after rewriting the colon form
+    so it can use the standard syntax.
+    """
+    if "$" not in arg:
+        return arg
+    template = string.Template(arg.replace("${aux:", "${aux_"))
+    mapping = {}
+    for k, v in substitutions.items():
+        if k.startswith("aux:"):
+            mapping[f"aux_{k[len('aux:'):]}"] = v
+        else:
+            mapping[k] = v
+    return template.substitute(mapping)
+
+
+# ---------------------------------------------------------------------------
 # Op execution
 # ---------------------------------------------------------------------------
 
 
-def _resolve_aux_placeholders(
-    argv: tuple[str, ...], aux_paths: dict[str, pathlib.Path]
-) -> list[str]:
-    template = string.Template
-    rendered = []
-    for arg in argv:
-        # Use simple manual substitution for ${aux:NAME}.
-        if "${aux:" in arg:
-            t = template(arg.replace("${aux:", "${aux_"))
-            mapping = {f"aux_{k}": str(v) for k, v in aux_paths.items()}
-            rendered.append(t.substitute(mapping))
-        else:
-            rendered.append(arg)
-    return rendered
-
-
-def _resolve_tool(name: str) -> str:
-    p = shutil.which(name) or shutil.which(name.replace(".", ""))
-    if p is None:
-        raise RuntimeError(f"binary not found on PATH: {name}")
-    return p
-
-
-def run_operation(op: operations_module.Operation, *, timeout_s: int) -> dict:
+def run_operation(
+    op: operations_module.Operation,
+    *,
+    manifest: dict[str, str],
+) -> dict:
     op_run = RUN_DIR / op.id
     if op_run.exists():
         shutil.rmtree(op_run)
@@ -169,23 +240,45 @@ def run_operation(op: operations_module.Operation, *, timeout_s: int) -> dict:
     mnt = op_run / "mnt"
     mnt.mkdir()
 
+    tool_path = _resolve_tool(op.tool, manifest)
     aux_paths = _ensure_aux_files(op.aux)
-    tool_path = _resolve_tool(op.tool)
     out_prefix = op_run / "out"
 
     trace_path = TRACES_DIR / f"{op.id}.jsonl"
     if trace_path.exists():
         trace_path.unlink()
 
-    rendered_argv = _resolve_aux_placeholders(op.argv, aux_paths)
-    cmd = [
-        tool_path,
-        "--bfile",
-        str(mnt / GOLDEN_PREFIX_NAME),
-        "--out",
-        str(out_prefix),
-        *rendered_argv,
-    ]
+    substitutions = {
+        "prefix": str(mnt / GOLDEN_PREFIX_NAME),
+        "bed": str(mnt / f"{GOLDEN_PREFIX_NAME}.bed"),
+        "bim": str(mnt / f"{GOLDEN_PREFIX_NAME}.bim"),
+        "fam": str(mnt / f"{GOLDEN_PREFIX_NAME}.fam"),
+        "mnt": str(mnt),
+        "out": str(out_prefix),
+        "runner": str(SCRIPTS_DIR / f"{op.tool}_runner.py"),
+        **{f"aux:{k}": str(v) for k, v in aux_paths.items()},
+    }
+
+    base_row = {
+        "id": op.id,
+        "tool": op.tool,
+        "category": op.category,
+        "label": op.label,
+    }
+
+    if tool_path is None and op.tool != "bedreader":
+        logger.warning("skipping %s: tool %r not found", op.id, op.tool)
+        return {
+            **base_row,
+            "argv": "",
+            "exit_code": "MISSING_TOOL",
+            "timed_out": False,
+            "elapsed_s": 0,
+            "trace": "",
+            "stderr_tail": f"tool {op.tool!r} not in manifest or $PATH",
+        }
+
+    cmd = _build_command(op, tool_path=tool_path or "", substitutions=substitutions)
 
     logger.info("--- %s (%s, %s)", op.id, op.tool, op.label)
     logger.info("argv: %s", " ".join(cmd))
@@ -206,7 +299,7 @@ def run_operation(op: operations_module.Operation, *, timeout_s: int) -> dict:
                 cmd,
                 capture_output=True,
                 check=False,
-                timeout=timeout_s,
+                timeout=op.timeout_s,
                 cwd=op_run,
             )
             elapsed = time.monotonic() - t0
@@ -227,11 +320,8 @@ def run_operation(op: operations_module.Operation, *, timeout_s: int) -> dict:
         log.close()
 
     return {
-        "id": op.id,
-        "tool": op.tool,
-        "category": op.category,
-        "label": op.label,
-        "argv": " ".join(rendered_argv),
+        **base_row,
+        "argv": " ".join(cmd),
         "exit_code": exit_code,
         "timed_out": timed_out,
         "elapsed_s": round(elapsed or 0, 3),
@@ -251,7 +341,12 @@ def main():
     parser.add_argument(
         "--only", nargs="*", default=None, help="run only ops with these ids"
     )
-    parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument(
+        "--tool",
+        nargs="*",
+        default=None,
+        help="run only ops whose tool name is in this list",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -268,18 +363,23 @@ def main():
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     RUN_DIR.mkdir(parents=True, exist_ok=True)
 
+    manifest = _load_tools_manifest()
+
     ops = list(operations_module.OPERATIONS)
     if not args.include_expensive:
         ops = [op for op in ops if not op.expensive]
     if args.only:
         wanted = set(args.only)
         ops = [op for op in ops if op.id in wanted]
+    if args.tool:
+        wanted_tools = set(args.tool)
+        ops = [op for op in ops if op.tool in wanted_tools]
 
     summary_path = RESULTS_DIR / "summary.csv"
     rows: list[dict] = []
     for op in ops:
         try:
-            row = run_operation(op, timeout_s=args.timeout)
+            row = run_operation(op, manifest=manifest)
         except Exception as exc:
             logger.exception("operation %s raised", op.id)
             row = {
