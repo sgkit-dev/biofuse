@@ -1,0 +1,6 @@
+data/
+traces/
+_runtime/
+_aux/
+_tools/
+__pycache__/
