@@ -69,6 +69,16 @@ uv run pytest tests/test_passthrough_view.py  # one module
 uv run ruff check .
 ```
 
+## Roadmap
+
+- **Phase 2 — streaming plink source.** The materialisation step in
+  phase 1 doesn't scale to large remote VCZ stores. The replacement
+  is a streaming source in `vcztools` that biofuse calls byte-range
+  reads against. The consumer-driven requirements spec lives at
+  [`specs/vcztools_streaming_plink.md`](specs/vcztools_streaming_plink.md);
+  the empirical basis is the IO study at
+  [`experiments/io-study/report.md`](experiments/io-study/report.md).
+
 ## Licence
 
 Apache 2.0. See `LICENSE`.

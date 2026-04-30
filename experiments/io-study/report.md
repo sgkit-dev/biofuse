@@ -366,6 +366,12 @@ The two tools are interchangeable from biofuse's perspective.
 
 ## Implications for biofuse phase 2
 
+The recommendations in this section have been folded into a formal
+consumer-driven requirements specification at
+[`specs/vcztools_streaming_plink.md`](../../specs/vcztools_streaming_plink.md),
+which is the binding artefact for `vcztools` implementers. The text
+below is the original phase-1 summary kept for context.
+
 A future streaming source in vcztools (replacing the materialise-and-
 passthrough shim) needs to support, in priority order:
 
