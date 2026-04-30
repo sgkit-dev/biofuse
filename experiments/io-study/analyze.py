@@ -22,6 +22,15 @@ Metrics per (op, file):
 - n_passes: # of indices where offset[i+1] < offset[i] (heuristic for
   "wrapped to start")
 - elapsed_s: t_monotonic[-1] - t_monotonic[0]
+- n_streams: count of "major" forward-progress streams (>= 100 KB)
+  detected by walking reads in time order and assigning each to an
+  existing stream whose last_end is within 1 MiB of this read's
+  offset, otherwise seeding a new stream.
+- n_minor_streams: count of streams below the major threshold
+  (e.g. one-shot tail probes).
+- dominant_stream_bytes_pct: % of bytes_read carried by the largest
+  major stream. 100 = single forward scan; ~100/N = N evenly-loaded
+  parallel readers.
 """
 
 import argparse
@@ -65,6 +74,52 @@ def _merge_ranges(records: list[tuple[int, int]]) -> int:
             cur_start, cur_end = start, end
     total += cur_end - cur_start
     return total
+
+
+_STREAM_TOLERANCE_BYTES = 1 << 20  # 1 MiB
+_MAJOR_STREAM_BYTES = 100 * 1024  # 100 KiB
+
+
+def _estimate_streams(records: list[dict]) -> tuple[int, int, float]:
+    """Estimate concurrent forward-progress streams from a read trace.
+
+    Walks records in monotonic-time order. Each read attaches to an
+    existing stream whose last_end is within ``_STREAM_TOLERANCE_BYTES``
+    of this read's offset (kernel readahead can leave small gaps).
+    Otherwise the read seeds a new stream.
+
+    Returns ``(n_major, n_minor, dominant_bytes_pct)`` where:
+    - ``n_major`` counts streams with >= ``_MAJOR_STREAM_BYTES`` total.
+    - ``n_minor`` counts the rest (one-shot probes, tiny seeks).
+    - ``dominant_bytes_pct`` is 100 * (largest major stream's bytes) /
+      total bytes; 0 if no major streams.
+    """
+    if not records:
+        return 0, 0, 0.0
+    sorted_recs = sorted(records, key=lambda r: r["t_monotonic"])
+    streams: list[dict] = []  # each: {"last_end", "bytes"}
+    for rec in sorted_recs:
+        offset = rec["offset"]
+        size = rec["size"]
+        match_idx = None
+        for i, s in enumerate(streams):
+            gap = offset - s["last_end"]
+            if 0 <= gap <= _STREAM_TOLERANCE_BYTES:
+                match_idx = i
+                break
+        if match_idx is not None:
+            streams[match_idx]["last_end"] = offset + size
+            streams[match_idx]["bytes"] += size
+        else:
+            streams.append({"last_end": offset + size, "bytes": size})
+    major = [s for s in streams if s["bytes"] >= _MAJOR_STREAM_BYTES]
+    minor_count = len(streams) - len(major)
+    if not major:
+        return 0, minor_count, 0.0
+    total_bytes = sum(s["bytes"] for s in streams)
+    dominant = max(s["bytes"] for s in major)
+    dom_pct = 100.0 * dominant / total_bytes if total_bytes else 0.0
+    return len(major), minor_count, dom_pct
 
 
 def _percentile(xs: list[int], q: float) -> float:
@@ -129,6 +184,7 @@ def analyse_trace(
         file_size = file_sizes.get(name, 0)
         coverage_pct = 100.0 * unique_bytes / file_size if file_size else 0.0
         redundancy = bytes_read / unique_bytes if unique_bytes else 0.0
+        n_streams, n_minor_streams, dom_pct = _estimate_streams(recs)
         out[name] = {
             "n_reads": len(recs),
             "bytes_read": bytes_read,
@@ -146,6 +202,9 @@ def analyse_trace(
             "elapsed_s": round(ts[-1] - ts[0], 3),
             "first_offset": offsets[0],
             "last_offset_end": offsets[-1] + sizes[-1],
+            "n_streams": n_streams,
+            "n_minor_streams": n_minor_streams,
+            "dominant_stream_bytes_pct": round(dom_pct, 2),
         }
     return out
 
@@ -173,6 +232,9 @@ def emit_long_csv(rows: list[dict], path: pathlib.Path) -> None:
         "elapsed_s",
         "first_offset",
         "last_offset_end",
+        "n_streams",
+        "n_minor_streams",
+        "dominant_stream_bytes_pct",
     ]
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -194,6 +256,9 @@ def emit_per_op_csv(per_op: list[dict], path: pathlib.Path) -> None:
         "max_seek_back",
         "n_passes",
         "elapsed_s",
+        "n_streams",
+        "n_minor_streams",
+        "dominant_stream_bytes_pct",
     )
     fieldnames = ["id", "tool", "category", "label"]
     for prefix in ("bed", "bim", "fam"):
@@ -298,6 +363,9 @@ def main():
                         "max_seek_back",
                         "n_passes",
                         "elapsed_s",
+                        "n_streams",
+                        "n_minor_streams",
+                        "dominant_stream_bytes_pct",
                     ):
                         wide_row[f"{short}_{k}"] = v
             per_op_rows.append(wide_row)

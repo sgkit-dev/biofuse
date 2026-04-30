@@ -265,7 +265,7 @@ failure) propagate from `__init__`.
 | NFR-4 | Sparse `read_variants` (≤ 10 variants spanning ≤ 10 chunks) | < 1 s p50 on local stores. |
 | NFR-5 | Memory: a12 cache | `2 · num_variants` bytes (int8 cache). |
 | NFR-5 | Memory: working set | Bounded by the underlying `variant_chunks` readahead window (default 256 MiB; configurable via `readahead_bytes`). |
-| NFR-6 | Concurrency | All public methods MUST be safe to call from multiple threads. Mutable state (a12 cache, fill mask) protected by a single lock; the read-side fast path MUST be lock-free after first publication. |
+| NFR-6 | Concurrency | All public methods MUST be safe to call from multiple threads. Mutable state (a12 cache, fill mask) protected by a single lock; the read-side fast path MUST be lock-free after first publication. **Note**: the IO study's threading extension confirmed plink1.9 / plink2 do not spawn concurrent `.bed` readers under `--threads N` for any tested op. The streaming source therefore is not required to optimise for many simultaneous `stream_bed()` iterators in the same process; thread-safety is for biofuse's internal use and for independent FUSE handles. See `experiments/io-study/report.md` § "Threading". |
 | NFR-7 | Determinism | Each call to `stream_bed()`, `read_bed(offset, size)`, `read_variants(idx)`, `read_tail(n)` returns byte-identical output for byte-identical inputs against the same store. |
 | NFR-8 | Read-only | The source MUST NOT modify the underlying VCZ store. |
 

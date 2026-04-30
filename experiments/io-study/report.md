@@ -362,6 +362,56 @@ For every operation tested in both tools:
 
 The two tools are interchangeable from biofuse's perspective.
 
+### Threading
+
+We re-ran every scan op and every heavy-compute op with explicit
+`--threads 8`. The question we wanted to answer: does plink open
+multiple concurrent `.bed` readers under threading, or does the
+single forward scan persist?
+
+The analyzer was extended with a stream-count metric. Walking the
+trace in monotonic-time order, each read is attached to an existing
+"active stream" if its offset continues from that stream's last_end
+(within a 1 MiB tolerance to absorb kernel readahead alignment);
+otherwise it seeds a new stream. The number of major streams (≥ 100
+KiB cumulative bytes) is the parallel reader count.
+
+**Headline finding: plink does NOT spawn concurrent `.bed` readers
+under `--threads N`. Every tested op stays single-stream sequential,
+identical to its default-threads run.**
+
+For all 21 `_t8` operations:
+
+| Metric | Value |
+| --- | --- |
+| `bed_n_reads` | 1901 (identical to default) |
+| `bed_bytes_read` | 248,693,753 (= file size) |
+| `bed_coverage_pct` | 100.00 |
+| `bed_n_streams` (major) | 1 |
+| `bed_n_minor_streams` | 1 (the tail probe) |
+| `bed_dominant_stream_bytes_pct` | 100.0 |
+
+The tail-probe-then-forward-scan signature is preserved; the ASCII
+strip plot for, e.g., `p19_pca_t8` is byte-identical to `p19_pca`.
+
+Wall-time effect of `--threads 8` was small but real for compute-
+heavy plink2 / plink1.9 ops (default → t8): `--pca approx` 156 s →
+144 s (-8 %), `--make-king` 7.5 s → 6.6 s (-12 %), `--pca`
+34.7 s → 29.8 s (-14 %), `--make-grm-bin` 34.2 s → 29.4 s (-14 %).
+Light ops (`--freq`, `--missing`, `--hardy`, `--het`) saw no
+significant change. The pattern is consistent across both tools:
+threading multiplexes the in-RAM computation after the genotype
+matrix has been loaded; the load itself remains a single forward
+read.
+
+The implication for biofuse phase 2 is clean: the streaming source
+can serve a single forward `.bed` reader per consumer process and
+need not optimise for N concurrent readers. (Of course, biofuse
+itself may want to support multiple FUSE handles to the mount —
+e.g., python tools reading `.bim` while plink scans `.bed` — but
+those are independent processes / handles, not threads inside one
+plink invocation.)
+
 ---
 
 ## Implications for biofuse phase 2
