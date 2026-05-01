@@ -23,7 +23,7 @@ class TestDefaultBasename:
         ],
     )
     def test_strips_all_extensions(self, path, expected):
-        assert plink_source._default_basename(path) == expected
+        assert plink_source.default_basename(path) == expected
 
 
 class TestLifecycle:

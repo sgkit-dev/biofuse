@@ -22,7 +22,13 @@ import pytest
 from vcztools.cli import make_reader
 from vcztools.plink import write_plink
 
-from biofuse import access_log, fuse_adapter, passthrough_view, plink_source
+from biofuse import (
+    access_log,
+    fuse_adapter,
+    passthrough_view,
+    plink_ops,
+    plink_source,
+)
 
 PLINK1 = shutil.which("plink1.9") or shutil.which("plink")
 PLINK2 = shutil.which("plink2")
@@ -40,14 +46,15 @@ def _wait_for_mount(mnt: pathlib.Path, timeout: float = 5.0) -> None:
     raise RuntimeError(f"mountpoint {mnt} not live after {timeout}s")
 
 
-@pytest.fixture
-def fx_mounted_plink(tmp_path, fx_medium_vcz):
-    """Mount the medium VCZ as a plink fileset via biofuse.
+@pytest.fixture(params=["passthrough", "streaming"])
+def fx_mounted_plink(request, tmp_path, fx_medium_vcz):
+    """Mount the medium VCZ as a plink fileset via biofuse, parametrised
+    over both phase 1 (passthrough) and phase 2 (streaming) backends.
 
-    Yields ``(mnt, basename, golden_dir)`` where ``golden_dir`` is a sibling
-    directory holding a directly-materialised version of the same fileset
-    for comparison.
+    Yields ``(mnt, basename, golden_dir, log)`` where ``golden_dir`` holds a
+    directly-materialised version of the same fileset for byte-comparison.
     """
+    mode = request.param
     mnt = tmp_path / "mnt"
     mnt.mkdir()
     golden = tmp_path / "golden_dir"
@@ -56,18 +63,29 @@ def fx_mounted_plink(tmp_path, fx_medium_vcz):
     write_plink(make_reader(str(fx_medium_vcz.path)), golden / "medium")
 
     log = access_log.AccessLogger()
-    source = plink_source.PlinkSource(fx_medium_vcz.path)
-    backing = source.open()
-    view = passthrough_view.PassthroughDirectoryView(backing, access_logger=log)
-    mount = fuse_adapter.Mount(view, str(mnt))
+    cleanups: list = []
+    if mode == "passthrough":
+        source = plink_source.PlinkSource(fx_medium_vcz.path)
+        backing = source.open()
+        view = passthrough_view.PassthroughDirectoryView(
+            backing, access_logger=log
+        )
+        ops = fuse_adapter.BiofuseOperations(view)
+        cleanups.append(view.close)
+        cleanups.append(source.close)
+    else:
+        reader = make_reader(str(fx_medium_vcz.path))
+        ops = plink_ops.PlinkOps(reader, "medium", access_logger=log)
+
+    mount = fuse_adapter.Mount(ops, str(mnt))
     mount.__enter__()
     try:
         _wait_for_mount(mnt)
         yield mnt, "medium", golden, log
     finally:
         mount.__exit__(None, None, None)
-        view.close()
-        source.close()
+        for cleanup in cleanups:
+            cleanup()
 
 
 def _run(cmd, **kwargs) -> subprocess.CompletedProcess:

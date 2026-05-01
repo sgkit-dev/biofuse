@@ -8,8 +8,15 @@ import threading
 from functools import wraps
 
 import click
+from vcztools import cli as vcztools_cli
 
-from biofuse import access_log, fuse_adapter, passthrough_view, plink_source
+from biofuse import (
+    access_log,
+    fuse_adapter,
+    passthrough_view,
+    plink_ops,
+    plink_source,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +115,8 @@ def mount_plink(
                 backing_dir, access_logger=access_logger
             )
             try:
-                with fuse_adapter.Mount(view, str(mount_dir_path)):
+                ops = fuse_adapter.BiofuseOperations(view)
+                with fuse_adapter.Mount(ops, str(mount_dir_path)):
                     click.echo(f"mounted at {mount_dir_path}", err=True)
                     _wait_for_signal()
                     click.echo("unmounting", err=True)
@@ -116,6 +124,50 @@ def mount_plink(
                 view.close()
     finally:
         source.close()
+
+
+@biofuse_main.command(name="mount-plink-streaming")
+@click.argument("vcz_url", type=str)
+@click.argument(
+    "mount_dir",
+    type=click.Path(file_okay=False, dir_okay=True, path_type=str),
+)
+@basename_opt
+@backend_storage
+@access_log_opt
+@verbose
+@handle_exception
+def mount_plink_streaming(
+    vcz_url, mount_dir, basename, backend_storage, access_log_path, verbose
+):
+    """Mount a streaming PLINK 1.9 view of VCZ_URL at MOUNT_DIR.
+
+    Unlike ``mount-plink``, this serves ``.bed`` on demand via
+    ``vcztools.BedEncoder`` (no upfront materialisation). The ``.bim`` and
+    ``.fam`` files are computed once at mount time and held in memory.
+
+    The mount runs in the foreground until interrupted with Ctrl-C.
+    """
+    _setup_logging(verbose)
+
+    mount_dir_path = pathlib.Path(mount_dir)
+    if not mount_dir_path.is_dir():
+        raise click.ClickException(f"mount directory does not exist: {mount_dir}")
+
+    log_path = pathlib.Path(access_log_path) if access_log_path is not None else None
+    resolved_basename = (
+        basename if basename is not None else plink_source.default_basename(vcz_url)
+    )
+
+    reader = vcztools_cli.make_reader(vcz_url, backend_storage=backend_storage)
+    with access_log.AccessLogger(log_path) as access_logger:
+        ops = plink_ops.PlinkOps(
+            reader, resolved_basename, access_logger=access_logger
+        )
+        with fuse_adapter.Mount(ops, str(mount_dir_path)):
+            click.echo(f"mounted at {mount_dir_path} (streaming)", err=True)
+            _wait_for_signal()
+            click.echo("unmounting", err=True)
 
 
 def _wait_for_signal() -> None:

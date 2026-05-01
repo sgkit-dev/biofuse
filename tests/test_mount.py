@@ -49,7 +49,8 @@ def fx_mount(tmp_path, fx_backing):
     mnt = tmp_path / "mnt"
     mnt.mkdir()
     view = passthrough_view.PassthroughDirectoryView(fx_backing)
-    mount = fuse_adapter.Mount(view, str(mnt))
+    ops = fuse_adapter.BiofuseOperations(view)
+    mount = fuse_adapter.Mount(ops, str(mnt))
     mount.__enter__()
     try:
         _wait_for_mount(mnt)
@@ -227,7 +228,8 @@ class TestAccessLogger:
         mnt.mkdir()
         log = access_log.AccessLogger()
         view = passthrough_view.PassthroughDirectoryView(fx_backing, access_logger=log)
-        with fuse_adapter.Mount(view, str(mnt)):
+        ops = fuse_adapter.BiofuseOperations(view)
+        with fuse_adapter.Mount(ops, str(mnt)):
             _wait_for_mount(mnt)
             (mnt / "alpha.bed").read_bytes()
         view.close()
@@ -250,7 +252,8 @@ class TestDirectIO:
         mnt = tmp_path / "mnt"
         mnt.mkdir()
         view = passthrough_view.PassthroughDirectoryView(fx_backing)
-        with fuse_adapter.Mount(view, str(mnt), direct_io=True):
+        ops = fuse_adapter.BiofuseOperations(view, direct_io=True)
+        with fuse_adapter.Mount(ops, str(mnt)):
             _wait_for_mount(mnt)
             assert (mnt / "alpha.bed").read_bytes() == (
                 fx_backing / "alpha.bed"
@@ -265,7 +268,8 @@ class TestDirectIO:
             fx_backing, access_logger=log
         )
         original = (fx_backing / "alpha.bed").read_bytes()
-        with fuse_adapter.Mount(view, str(mnt), direct_io=True):
+        ops = fuse_adapter.BiofuseOperations(view, direct_io=True)
+        with fuse_adapter.Mount(ops, str(mnt)):
             _wait_for_mount(mnt)
             # Run mmap in a child process so the page-fault path is the
             # same kernel codepath that a real consumer (e.g. bed-reader)
@@ -312,7 +316,8 @@ class TestMountLifecycle:
         mnt = tmp_path / "mnt"
         mnt.mkdir()
         view = passthrough_view.PassthroughDirectoryView(fx_backing)
-        with fuse_adapter.Mount(view, str(mnt)):
+        ops = fuse_adapter.BiofuseOperations(view)
+        with fuse_adapter.Mount(ops, str(mnt)):
             _wait_for_mount(mnt)
             assert os.path.ismount(mnt)
         assert not os.path.ismount(mnt)
@@ -325,10 +330,12 @@ class TestMountLifecycle:
         mnt2.mkdir()
         view1 = passthrough_view.PassthroughDirectoryView(fx_backing)
         view2 = passthrough_view.PassthroughDirectoryView(fx_backing)
-        with fuse_adapter.Mount(view1, str(mnt1)):
+        ops1 = fuse_adapter.BiofuseOperations(view1)
+        ops2 = fuse_adapter.BiofuseOperations(view2)
+        with fuse_adapter.Mount(ops1, str(mnt1)):
             _wait_for_mount(mnt1)
             with pytest.raises(RuntimeError, match="another biofuse Mount"):
-                with fuse_adapter.Mount(view2, str(mnt2)):
+                with fuse_adapter.Mount(ops2, str(mnt2)):
                     pass
         view1.close()
         view2.close()
@@ -386,7 +393,8 @@ class TestVczGoldenParity:
         mnt = tmp_path / "mnt"
         mnt.mkdir()
         view = passthrough_view.PassthroughDirectoryView(backing)
-        with fuse_adapter.Mount(view, str(mnt)):
+        ops = fuse_adapter.BiofuseOperations(view)
+        with fuse_adapter.Mount(ops, str(mnt)):
             _wait_for_mount(mnt)
             for suffix in (".bed", ".bim", ".fam"):
                 got = (mnt / f"small{suffix}").read_bytes()
