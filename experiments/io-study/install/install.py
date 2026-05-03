@@ -65,9 +65,7 @@ def _download(url: str, dest: pathlib.Path) -> None:
 
 def _find_member_in_tar(tar: tarfile.TarFile, pattern: str) -> tarfile.TarInfo:
     matches = [
-        m
-        for m in tar.getmembers()
-        if m.isfile() and fnmatch.fnmatch(m.name, pattern)
+        m for m in tar.getmembers() if m.isfile() and fnmatch.fnmatch(m.name, pattern)
     ]
     if len(matches) == 0:
         raise RuntimeError(f"no archive member matching {pattern!r}")
@@ -80,9 +78,7 @@ def _find_member_in_tar(tar: tarfile.TarFile, pattern: str) -> tarfile.TarInfo:
 
 def _find_member_in_zip(zf: zipfile.ZipFile, pattern: str) -> str:
     matches = [
-        n
-        for n in zf.namelist()
-        if not n.endswith("/") and fnmatch.fnmatch(n, pattern)
+        n for n in zf.namelist() if not n.endswith("/") and fnmatch.fnmatch(n, pattern)
     ]
     if len(matches) == 0:
         raise RuntimeError(f"no archive member matching {pattern!r}")

@@ -161,9 +161,7 @@ def mount_plink_streaming(
 
     reader = vcztools_cli.make_reader(vcz_url, backend_storage=backend_storage)
     with access_log.AccessLogger(log_path) as access_logger:
-        ops = plink_ops.PlinkOps(
-            reader, resolved_basename, access_logger=access_logger
-        )
+        ops = plink_ops.PlinkOps(reader, resolved_basename, access_logger=access_logger)
         with fuse_adapter.Mount(ops, str(mount_dir_path)):
             click.echo(f"mounted at {mount_dir_path} (streaming)", err=True)
             _wait_for_signal()

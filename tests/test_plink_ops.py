@@ -7,12 +7,13 @@ tests/test_plink_apps.py.
 
 import errno
 import os
-import pathlib
+import random
 import stat
 
 import pyfuse3
 import pytest
 import trio
+from vcztools import plink as vcztools_plink
 from vcztools.cli import make_reader
 from vcztools.plink import write_plink
 
@@ -74,12 +75,12 @@ class TestStaticBytesFile:
 
     def test_negative_offset_raises(self):
         f = plink_ops._StaticBytesFile("x.bim", b"abc")
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="off must be >= 0"):
             f.read(-1, 10)
 
     def test_negative_size_raises(self):
         f = plink_ops._StaticBytesFile("x.bim", b"abc")
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="size must be >= 0"):
             f.read(0, -1)
 
     def test_close_is_idempotent(self):
@@ -147,9 +148,7 @@ class TestLookup:
         assert attrs.st_size == (golden / "small.bed").stat().st_size
 
     def test_unknown_name(self, fx_ops):
-        _expect_fuse_error(
-            fx_ops.lookup(pyfuse3.ROOT_INODE, b"nope.bed"), errno.ENOENT
-        )
+        _expect_fuse_error(fx_ops.lookup(pyfuse3.ROOT_INODE, b"nope.bed"), errno.ENOENT)
 
     def test_invalid_utf8(self, fx_ops):
         _expect_fuse_error(
@@ -173,14 +172,12 @@ class TestReaddir:
             emitted.append((name.decode("utf-8"), next_id))
             return True
 
-        import pyfuse3 as _pyfuse3
-
-        original = _pyfuse3.readdir_reply
-        _pyfuse3.readdir_reply = fake_readdir_reply
+        original = pyfuse3.readdir_reply
+        pyfuse3.readdir_reply = fake_readdir_reply
         try:
             run(fx_ops.readdir(pyfuse3.ROOT_INODE, 0, token))
         finally:
-            _pyfuse3.readdir_reply = original
+            pyfuse3.readdir_reply = original
         assert [n for n, _ in emitted] == ["small.bed", "small.bim", "small.fam"]
 
     def test_readdir_resumes_from_start_id(self, fx_ops):
@@ -190,14 +187,12 @@ class TestReaddir:
             emitted.append(name.decode("utf-8"))
             return True
 
-        import pyfuse3 as _pyfuse3
-
-        original = _pyfuse3.readdir_reply
-        _pyfuse3.readdir_reply = fake_readdir_reply
+        original = pyfuse3.readdir_reply
+        pyfuse3.readdir_reply = fake_readdir_reply
         try:
             run(fx_ops.readdir(pyfuse3.ROOT_INODE, 1, object()))
         finally:
-            _pyfuse3.readdir_reply = original
+            pyfuse3.readdir_reply = original
         # entry_id 1 was the first entry (small.bed); resuming after it should
         # emit only the remaining two.
         assert emitted == ["small.bim", "small.fam"]
@@ -222,8 +217,6 @@ class TestOpenFlags:
 
 class TestOpenDispatch:
     def test_bed_open_uses_bed_encoder(self, fx_ops):
-        from vcztools import plink as vcztools_plink
-
         inode = fx_ops._name_to_inode["small.bed"]
         info = run(fx_ops.open(inode, os.O_RDONLY))
         try:
@@ -286,8 +279,6 @@ class TestBedReadParity:
             run(fx_ops.release(info.fh))
 
     def test_random_pread(self, fx_ops, fx_golden_dir):
-        import random
-
         golden, basename = fx_golden_dir
         expected = (golden / f"{basename}.bed").read_bytes()
         inode = fx_ops._name_to_inode[f"{basename}.bed"]

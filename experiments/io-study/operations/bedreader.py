@@ -16,9 +16,12 @@ from .base import Operation
 def _runner_argv(op_name: str) -> tuple[str, ...]:
     return (
         "${runner}",
-        "--bfile", "${prefix}",
-        "--op", op_name,
-        "--out", "${out}",
+        "--bfile",
+        "${prefix}",
+        "--op",
+        op_name,
+        "--out",
+        "${out}",
     )
 
 

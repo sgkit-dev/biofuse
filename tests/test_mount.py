@@ -264,9 +264,7 @@ class TestDirectIO:
         mnt = tmp_path / "mnt"
         mnt.mkdir()
         log = access_log.AccessLogger()
-        view = passthrough_view.PassthroughDirectoryView(
-            fx_backing, access_logger=log
-        )
+        view = passthrough_view.PassthroughDirectoryView(fx_backing, access_logger=log)
         original = (fx_backing / "alpha.bed").read_bytes()
         ops = fuse_adapter.BiofuseOperations(view, direct_io=True)
         with fuse_adapter.Mount(ops, str(mnt)):

@@ -157,9 +157,7 @@ class PlinkOps(pyfuse3.Operations):
             self._inode_to_entry[inode] = entry
 
         self._next_fh = 1
-        self._open_files: dict[
-            int, _StaticBytesFile | vcztools_plink.BedEncoder
-        ] = {}
+        self._open_files: dict[int, _StaticBytesFile | vcztools_plink.BedEncoder] = {}
 
     def _build_attrs(self, inode: int) -> pyfuse3.EntryAttributes:
         attrs = pyfuse3.EntryAttributes()
@@ -246,7 +244,11 @@ class PlinkOps(pyfuse3.Operations):
         except OSError as exc:
             raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
         if self._access_logger is not None:
-            name = backend.name if isinstance(backend, _StaticBytesFile) else self._bed_name
+            name = (
+                backend.name
+                if isinstance(backend, _StaticBytesFile)
+                else self._bed_name
+            )
             self._access_logger.record(name, off, len(data))
         return data
 

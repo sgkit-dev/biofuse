@@ -13,25 +13,24 @@ permissions:
 jobs:
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v6
+      - name: Install uv and set the python version
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
       - name: Install lint group
-        run: uv sync --only-group lint
+        run: uv sync --locked --only-group lint
 
-      - name: Run ruff check
-        run: uv run --only-group lint ruff check .
-
-      - name: Run ruff format check
-        run: uv run --only-group lint ruff format --check .
+      - name: Run prek
+        run: |
+          uv run --locked --only-group lint \
+          prek -c prek.toml run --all-files --show-diff-on-failure
 
   test:
     name: Test (Python ${{ matrix.python-version }})
@@ -41,15 +40,8 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          persist-credentials: false
-
-      - name: Check out vcztools (path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: sgkit-dev/vcztools
-          path: ../vcztools
           persist-credentials: false
 
       - name: Install system packages
@@ -60,7 +52,7 @@ jobs:
               plink1.9 plink2
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -74,7 +66,7 @@ jobs:
     name: Packaging
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -83,7 +75,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev pkg-config
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
         with:
           python-version: "3.12"
 

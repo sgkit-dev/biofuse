@@ -67,9 +67,7 @@ def fx_mounted_plink(request, tmp_path, fx_medium_vcz):
     if mode == "passthrough":
         source = plink_source.PlinkSource(fx_medium_vcz.path)
         backing = source.open()
-        view = passthrough_view.PassthroughDirectoryView(
-            backing, access_logger=log
-        )
+        view = passthrough_view.PassthroughDirectoryView(backing, access_logger=log)
         ops = fuse_adapter.BiofuseOperations(view)
         cleanups.append(view.close)
         cleanups.append(source.close)
