@@ -45,7 +45,6 @@ class BedEncoderClient:
     async def connect(
         cls,
         vcz_url: str,
-        basename: str,
         *,
         backend_storage: str | None = None,
     ) -> "BedEncoderClient":
@@ -63,8 +62,8 @@ class BedEncoderClient:
         try:
             proc: mp.process.BaseProcess = ctx.Process(
                 target=bed_worker._worker_main,
-                args=(child_sock, vcz_url, basename, backend_storage),
-                name=f"biofuse-bed-worker[{basename}]",
+                args=(child_sock, vcz_url, backend_storage),
+                name="biofuse-bed-worker",
             )
             proc.start()
         finally:
@@ -106,22 +105,24 @@ class BedEncoderClient:
     # -- public API ------------------------------------------------------
 
     @property
-    def file_entries(self) -> list[bed_protocol.FileSpec]:
-        return list(self._file_entries)
+    def file_entries(self) -> dict[bed_protocol.FileType, int]:
+        """Mapping of ``FileType`` → size in bytes for each served file."""
+        return dict(self._file_entries)
 
-    async def open(self, name: str) -> tuple[int, int, int]:
-        """Open ``name`` in the worker. Returns ``(handle, size, mode)``."""
-        request = bed_protocol.pack_open_request(name)
-        status, body = await self._roundtrip(
-            request, body_size=bed_protocol.REPLY_OPEN_BODY_SIZE
-        )
+    async def open(self, fh: int, file_type: bed_protocol.FileType) -> None:
+        """Allocate ``fh`` in the worker as a backend of ``file_type``.
+
+        The caller (PlinkOps) owns the fh space and is responsible for
+        not reusing in-use handles.
+        """
+        request = bed_protocol.pack_open_request(fh, file_type)
+        status, _ = await self._roundtrip(request, body_size=0)
         if status < 0:
             raise bed_protocol.status_to_error(status)
-        return bed_protocol.parse_open_body(body)
 
-    async def read(self, handle: int, offset: int, size: int) -> bytes:
-        """Read ``size`` bytes at ``offset`` for ``handle``."""
-        request = bed_protocol.pack_read_request(handle, offset, size)
+    async def read(self, fh: int, offset: int, size: int) -> bytes:
+        """Read ``size`` bytes at ``offset`` for ``fh``."""
+        request = bed_protocol.pack_read_request(fh, offset, size)
         async with self._lock:
             await self._stream.send_all(request)
             status_buf = await _recv_exact(
@@ -134,9 +135,9 @@ class BedEncoderClient:
                 return b""
             return await _recv_exact(self._stream, status)
 
-    async def release(self, handle: int) -> None:
-        """Release ``handle`` in the worker."""
-        request = bed_protocol.pack_close_request(handle)
+    async def release(self, fh: int) -> None:
+        """Release ``fh`` in the worker."""
+        request = bed_protocol.pack_close_request(fh)
         status, _ = await self._roundtrip(request, body_size=0)
         if status < 0:
             raise bed_protocol.status_to_error(status)
@@ -177,7 +178,7 @@ class BedEncoderClient:
             body = await _recv_exact(self._stream, body_size)
             return status, body
 
-    async def _handshake_list(self) -> list[bed_protocol.FileSpec]:
+    async def _handshake_list(self) -> dict[bed_protocol.FileType, int]:
         await self._stream.send_all(bed_protocol.pack_list_request())
         status_buf = await _recv_exact(
             self._stream, bed_protocol.REPLY_STATUS_SIZE
@@ -185,18 +186,13 @@ class BedEncoderClient:
         status = bed_protocol.parse_status(status_buf)
         if status < 0:
             raise bed_protocol.status_to_error(status)
-        entries: list[bed_protocol.FileSpec] = []
+        entries: dict[bed_protocol.FileType, int] = {}
         for _ in range(status):
-            hdr = await _recv_exact(
-                self._stream, bed_protocol.REPLY_LIST_ENTRY_HDR_SIZE
+            entry = await _recv_exact(
+                self._stream, bed_protocol.REPLY_LIST_ENTRY_SIZE
             )
-            name_len, size, mode = bed_protocol.parse_list_entry_header(hdr)
-            name_bytes = (
-                await _recv_exact(self._stream, name_len) if name_len > 0 else b""
-            )
-            entries.append(
-                bed_protocol.FileSpec(name_bytes.decode("utf-8"), size, mode)
-            )
+            file_type, size = bed_protocol.parse_list_entry(entry)
+            entries[file_type] = size
         return entries
 
     def _sync_join_proc(self) -> None:

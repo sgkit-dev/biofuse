@@ -17,18 +17,10 @@ class TestRequestFraming:
         assert bed_protocol.pack_list_request() == b"L"
 
     def test_open_request_layout(self):
-        buf = bed_protocol.pack_open_request("small.bed")
+        buf = bed_protocol.pack_open_request(7, bed_protocol.FileType.BED)
         assert buf[:1] == b"O"
-        (name_len,) = struct.unpack("<I", buf[1:5])
-        assert name_len == len("small.bed")
-        assert buf[5:].decode("utf-8") == "small.bed"
-
-    def test_open_request_utf8_multibyte(self):
-        name = "tëst.bed"
-        buf = bed_protocol.pack_open_request(name)
-        (name_len,) = struct.unpack("<I", buf[1:5])
-        assert name_len == len(name.encode("utf-8"))
-        assert buf[5:].decode("utf-8") == name
+        fh, file_type = struct.unpack("<QB", buf[1:])
+        assert (fh, file_type) == (7, int(bed_protocol.FileType.BED))
 
     def test_read_request_layout(self):
         buf = bed_protocol.pack_read_request(7, 4096, 8192)
@@ -44,14 +36,17 @@ class TestRequestFraming:
 
 
 class TestRequestParsing:
-    def test_open_length_header_and_payload_roundtrip(self):
-        name = "alt.fam"
-        buf = bed_protocol.pack_open_request(name)
-        # Skip the tag byte; transport reads it separately.
-        body = buf[1:]
-        name_len = bed_protocol.parse_open_length_header(body[:4])
-        payload = body[4 : 4 + name_len]
-        assert bed_protocol.parse_open_payload(payload) == name
+    @pytest.mark.parametrize(
+        "file_type",
+        [
+            bed_protocol.FileType.BED,
+            bed_protocol.FileType.BIM,
+            bed_protocol.FileType.FAM,
+        ],
+    )
+    def test_open_payload_roundtrip(self, file_type):
+        buf = bed_protocol.pack_open_request(123, file_type)
+        assert bed_protocol.parse_open_payload(buf[1:]) == (123, file_type)
 
     def test_read_payload_roundtrip(self):
         buf = bed_protocol.pack_read_request(123, 1, 2)
@@ -81,9 +76,9 @@ class TestReplyFraming:
 
     def test_list_reply_three_entries_roundtrip(self):
         entries = [
-            bed_protocol.FileSpec("a.bed", 1024, 0o100444),
-            bed_protocol.FileSpec("a.bim", 100, 0o100444),
-            bed_protocol.FileSpec("a.fam", 50, 0o100444),
+            (bed_protocol.FileType.BED, 1024),
+            (bed_protocol.FileType.BIM, 100),
+            (bed_protocol.FileType.FAM, 50),
         ]
         buf = bed_protocol.pack_list_reply(entries)
         status = bed_protocol.parse_status(buf[:8])
@@ -91,21 +86,16 @@ class TestReplyFraming:
         offset = 8
         seen = []
         for _ in range(status):
-            hdr = buf[offset : offset + bed_protocol.REPLY_LIST_ENTRY_HDR_SIZE]
-            name_len, size, mode = bed_protocol.parse_list_entry_header(hdr)
-            offset += bed_protocol.REPLY_LIST_ENTRY_HDR_SIZE
-            name = buf[offset : offset + name_len].decode("utf-8")
-            offset += name_len
-            seen.append(bed_protocol.FileSpec(name, size, mode))
+            entry = buf[offset : offset + bed_protocol.REPLY_LIST_ENTRY_SIZE]
+            offset += bed_protocol.REPLY_LIST_ENTRY_SIZE
+            seen.append(bed_protocol.parse_list_entry(entry))
         assert seen == entries
         assert offset == len(buf)
 
-    def test_open_reply_roundtrip(self):
-        buf = bed_protocol.pack_open_reply(handle=11, size=2048, mode=0o100444)
-        status = bed_protocol.parse_status(buf[:8])
-        assert status == 0
-        body = buf[8 : 8 + bed_protocol.REPLY_OPEN_BODY_SIZE]
-        assert bed_protocol.parse_open_body(body) == (11, 2048, 0o100444)
+    def test_open_reply_is_zero_status(self):
+        buf = bed_protocol.pack_open_reply()
+        assert bed_protocol.parse_status(buf) == 0
+        assert len(buf) == bed_protocol.REPLY_STATUS_SIZE
 
     def test_read_reply_roundtrip(self):
         data = b"hello, world\x00\x01\x02"
@@ -141,11 +131,6 @@ class TestStatusToError:
 class TestErrnoForException:
     def test_oserror_errno_propagates(self):
         exc = OSError(errno.ENOENT, "missing")
-        assert bed_protocol.errno_for_exception(exc) == errno.ENOENT
-
-    def test_filenotfound_carries_enoent(self):
-        # FileNotFoundError sets errno=ENOENT automatically.
-        exc = FileNotFoundError(errno.ENOENT, "missing")
         assert bed_protocol.errno_for_exception(exc) == errno.ENOENT
 
     def test_arbitrary_exception_falls_back_to_eio(self):

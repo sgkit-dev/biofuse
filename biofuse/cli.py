@@ -127,10 +127,10 @@ async def _amount(
     log_path: pathlib.Path | None,
 ) -> None:
     async with await bed_client.BedEncoderClient.connect(
-        vcz_url, basename, backend_storage=backend_storage
+        vcz_url, backend_storage=backend_storage
     ) as client:
         with access_log.AccessLogger(log_path) as access_logger:
-            ops = plink_ops.PlinkOps(client, access_logger=access_logger)
+            ops = plink_ops.PlinkOps(client, basename, access_logger=access_logger)
             async with fuse_adapter.mount(ops, mount_dir):
                 click.echo(f"mounted at {mount_dir}", err=True)
                 await _wait_for_signal()

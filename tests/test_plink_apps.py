@@ -68,9 +68,9 @@ async def fx_mounted_plink(tmp_path, fx_medium_vcz):
 
     log = access_log.AccessLogger()
     async with await bed_client.BedEncoderClient.connect(
-        str(fx_medium_vcz.path), "medium"
+        str(fx_medium_vcz.path)
     ) as client:
-        ops = plink_ops.PlinkOps(client, access_logger=log)
+        ops = plink_ops.PlinkOps(client, "medium", access_logger=log)
         async with fuse_adapter.mount(ops, str(mnt)):
             await _wait_for_mount(mnt)
             yield mnt, "medium", golden, log

@@ -3,29 +3,30 @@
 Three layers, each independently testable:
 
 - :class:`WorkerSession` is pure logic. It owns the ``VczReader``,
-  the precomputed ``.bim``/``.fam`` bytes and a table of open handles
-  ({id -> :class:`vcztools.plink.BedEncoder` or :class:`_StaticBytesFile`}).
-  No sockets, no subprocess: tests can construct it directly.
+  the precomputed ``.bim``/``.fam`` bytes, and a table of open handles
+  ({fh -> :class:`vcztools.plink.BedEncoder` or
+  :class:`_StaticBytesFile`}). The worker never sees filenames; the
+  parent (PlinkOps) assigns each fh and tags it with a
+  :class:`bed_protocol.FileType`. No sockets, no subprocess: tests
+  can construct it directly.
 
-- :func:`serve` is a blocking sync loop that reads framed requests off
-  a socket and writes framed replies. It depends only on the ``socket``
-  module and a session object, so tests can drive it via an in-process
-  ``socket.socketpair`` running in a thread.
+- :func:`serve` is a blocking sync loop that reads framed requests
+  off a socket and writes framed replies. Tests can drive it via an
+  in-process ``socket.socketpair`` running on a thread.
 
 - :func:`_worker_main` is the subprocess entry point used by
-  ``BedEncoderClient``. It receives a ``socket.socket`` (handle-passed
-  by ``multiprocessing``), constructs a :class:`WorkerSession`, then
-  calls :func:`serve`.
+  :class:`BedEncoderClient`. It receives a ``socket.socket``
+  (handle-passed by ``multiprocessing``), constructs a
+  :class:`WorkerSession`, then runs :func:`serve`.
 
-Only this module imports ``vcztools``. The parent FUSE process must not
-import this module — that is what keeps the FUSE process free of Zarr
-machinery.
+Only this module imports ``vcztools``. The parent FUSE process must
+not import this module — that is what keeps the FUSE process free of
+Zarr machinery.
 """
 
 import errno
 import logging
 import socket
-import stat
 
 from vcztools import cli as vcztools_cli
 from vcztools import plink as vcztools_plink
@@ -39,19 +40,14 @@ logger = logging.getLogger(__name__)
 class _StaticBytesFile:
     """Per-handle adapter for a file whose bytes are precomputed in memory.
 
-    Implements the same ``read(off, size) -> bytes`` and ``close()`` shape
-    as :class:`vcztools.plink.BedEncoder` so :class:`WorkerSession` can
-    dispatch uniformly.
+    Implements the same ``read(off, size) -> bytes`` and ``close()``
+    shape as :class:`vcztools.plink.BedEncoder` so
+    :class:`WorkerSession` can dispatch uniformly.
     """
 
-    def __init__(self, name: str, data: bytes) -> None:
-        self._name = name
+    def __init__(self, data: bytes) -> None:
         self._data = data
         self._closed = False
-
-    @property
-    def name(self) -> str:
-        return self._name
 
     @property
     def size(self) -> int:
@@ -77,24 +73,20 @@ class WorkerSession:
     """In-process logic for the bed-worker subprocess.
 
     Holds a single ``VczReader`` and the precomputed ``.bim``/``.fam``
-    bytes for the requested basename. ``open(name)`` allocates a fresh
-    backend (``BedEncoder`` for ``.bed``, ``_StaticBytesFile`` for
-    ``.bim``/``.fam``) and returns its handle id. ``read`` and
-    ``release`` look the backend up by handle.
+    bytes. ``open(fh, file_type)`` materialises a backend keyed by the
+    caller-assigned ``fh``: a fresh ``BedEncoder`` for
+    :attr:`FileType.BED`, an in-memory bytes view for
+    :attr:`FileType.BIM` / :attr:`FileType.FAM`. ``read`` and
+    ``release`` look the backend up by ``fh``.
 
     Parameters
     ----------
     reader
         Already-constructed ``VczReader``. The caller owns its
         lifetime; ``WorkerSession`` does not close it.
-    basename
-        Stem used for the three exposed files: ``{basename}.bed``,
-        ``{basename}.bim``, ``{basename}.fam``.
     """
 
-    def __init__(
-        self, reader: vcztools_retrieval.VczReader, basename: str
-    ) -> None:
+    def __init__(self, reader: vcztools_retrieval.VczReader) -> None:
         self._reader = reader
 
         bim_text = vcztools_plink.generate_bim(reader)
@@ -105,55 +97,43 @@ class WorkerSession:
         num_variants = reader.num_variants
         num_samples = int(reader.sample_ids.size)
         bytes_per_variant = (num_samples + 3) // 4
-        bed_size = 3 + num_variants * bytes_per_variant
+        self._bed_size = 3 + num_variants * bytes_per_variant
 
-        self._bed_name = f"{basename}.bed"
-        self._bim_name = f"{basename}.bim"
-        self._fam_name = f"{basename}.fam"
-
-        mode = stat.S_IFREG | 0o444
-        self._files: dict[str, bed_protocol.FileSpec] = {
-            self._bed_name: bed_protocol.FileSpec(self._bed_name, bed_size, mode),
-            self._bim_name: bed_protocol.FileSpec(
-                self._bim_name, len(self._bim_bytes), mode
-            ),
-            self._fam_name: bed_protocol.FileSpec(
-                self._fam_name, len(self._fam_bytes), mode
-            ),
-        }
-
-        self._next_handle = 1
         self._open_handles: dict[
             int, vcztools_plink.BedEncoder | _StaticBytesFile
         ] = {}
 
-    def list_files(self) -> list[bed_protocol.FileSpec]:
-        return sorted(self._files.values(), key=lambda spec: spec.name)
+    def list_files(self) -> list[tuple[bed_protocol.FileType, int]]:
+        return [
+            (bed_protocol.FileType.BED, self._bed_size),
+            (bed_protocol.FileType.BIM, len(self._bim_bytes)),
+            (bed_protocol.FileType.FAM, len(self._fam_bytes)),
+        ]
 
-    def open(self, name: str) -> tuple[int, int, int]:
-        """Allocate a backend for ``name`` and return ``(handle, size, mode)``."""
-        spec = self._files.get(name)
-        if spec is None:
-            raise FileNotFoundError(errno.ENOENT, "no such file", name)
-        if name == self._bed_name:
-            backend = vcztools_plink.BedEncoder(self._reader)
-        elif name == self._bim_name:
-            backend = _StaticBytesFile(name, self._bim_bytes)
+    def open(self, fh: int, file_type: bed_protocol.FileType) -> None:
+        """Allocate a backend for ``fh``. Raises if ``fh`` is already open."""
+        if fh in self._open_handles:
+            raise OSError(errno.EEXIST, f"handle {fh} already open")
+        if file_type == bed_protocol.FileType.BED:
+            backend: vcztools_plink.BedEncoder | _StaticBytesFile = (
+                vcztools_plink.BedEncoder(self._reader)
+            )
+        elif file_type == bed_protocol.FileType.BIM:
+            backend = _StaticBytesFile(self._bim_bytes)
+        elif file_type == bed_protocol.FileType.FAM:
+            backend = _StaticBytesFile(self._fam_bytes)
         else:
-            backend = _StaticBytesFile(name, self._fam_bytes)
-        handle = self._next_handle
-        self._next_handle += 1
-        self._open_handles[handle] = backend
-        return handle, spec.size, spec.mode
+            raise OSError(errno.EINVAL, f"unknown file_type {file_type}")
+        self._open_handles[fh] = backend
 
-    def read(self, handle: int, off: int, size: int) -> bytes:
-        backend = self._open_handles.get(handle)
+    def read(self, fh: int, off: int, size: int) -> bytes:
+        backend = self._open_handles.get(fh)
         if backend is None:
-            raise OSError(errno.EBADF, f"unknown handle {handle}")
+            raise OSError(errno.EBADF, f"unknown handle {fh}")
         return backend.read(off, size)
 
-    def release(self, handle: int) -> None:
-        backend = self._open_handles.pop(handle, None)
+    def release(self, fh: int) -> None:
+        backend = self._open_handles.pop(fh, None)
         if backend is None:
             return
         backend.close()
@@ -208,14 +188,10 @@ def _read_request(
     if tag == bed_protocol.TAG_LIST:
         return tag, ()
     if tag == bed_protocol.TAG_OPEN:
-        hdr = _recv_exact_sync(sock, bed_protocol.REQ_OPEN_HDR_SIZE)
-        if len(hdr) < bed_protocol.REQ_OPEN_HDR_SIZE:
-            raise EOFError("socket closed mid-OPEN header")
-        name_len = bed_protocol.parse_open_length_header(hdr)
-        name_buf = _recv_exact_sync(sock, name_len) if name_len > 0 else b""
-        if len(name_buf) < name_len:
-            raise EOFError("socket closed mid-OPEN name")
-        return tag, (bed_protocol.parse_open_payload(name_buf),)
+        body = _recv_exact_sync(sock, bed_protocol.REQ_OPEN_PAYLOAD_SIZE)
+        if len(body) < bed_protocol.REQ_OPEN_PAYLOAD_SIZE:
+            raise EOFError("socket closed mid-OPEN payload")
+        return tag, bed_protocol.parse_open_payload(body)
     if tag == bed_protocol.TAG_READ:
         body = _recv_exact_sync(sock, bed_protocol.REQ_READ_PAYLOAD_SIZE)
         if len(body) < bed_protocol.REQ_READ_PAYLOAD_SIZE:
@@ -232,9 +208,9 @@ def _read_request(
 def serve(sock: socket.socket, session: WorkerSession) -> None:
     """Blocking request/reply loop. Returns on clean EOF.
 
-    Errors raised by the session are translated to negative-status error
-    replies; the loop continues. Framing errors (truncated requests,
-    unknown tags) are logged and the loop exits.
+    Errors raised by the session are translated to negative-status
+    error replies; the loop continues. Framing errors (truncated
+    requests, unknown tags) are logged and the loop exits.
     """
     try:
         while True:
@@ -253,7 +229,7 @@ def serve(sock: socket.socket, session: WorkerSession) -> None:
                 reply = _dispatch(session, tag, args)
             except Exception as exc:  # noqa: BLE001 - any error becomes errno reply
                 err = bed_protocol.errno_for_exception(exc)
-                if not isinstance(exc, FileNotFoundError | OSError):
+                if not isinstance(exc, OSError):
                     logger.exception("worker dispatch raised; replying with EIO")
                 reply = bed_protocol.pack_error_reply(err)
             try:
@@ -272,16 +248,16 @@ def _dispatch(
         entries = session.list_files()
         return bed_protocol.pack_list_reply(entries)
     if tag == bed_protocol.TAG_OPEN:
-        (name,) = args
-        handle, size, mode = session.open(name)
-        return bed_protocol.pack_open_reply(handle, size, mode)
+        fh, file_type = args
+        session.open(fh, file_type)
+        return bed_protocol.pack_open_reply()
     if tag == bed_protocol.TAG_READ:
-        handle, off, size = args
-        data = session.read(handle, off, size)
+        fh, off, size = args
+        data = session.read(fh, off, size)
         return bed_protocol.pack_read_reply(data)
     if tag == bed_protocol.TAG_CLOSE:
-        (handle,) = args
-        session.release(handle)
+        (fh,) = args
+        session.release(fh)
         return bed_protocol.pack_close_reply()
     raise ValueError(f"unknown tag in dispatch: {tag!r}")
 
@@ -292,7 +268,6 @@ def _dispatch(
 def _worker_main(
     sock: socket.socket,
     vcz_url: str,
-    basename: str,
     backend_storage: str | None,
 ) -> None:
     """Subprocess entry point started via ``multiprocessing.Process``.
@@ -302,11 +277,11 @@ def _worker_main(
     socket in the child pointing at the same underlying connection).
 
     Constructs a ``VczReader`` and a :class:`WorkerSession`, then runs
-    :func:`serve`. Returns on socket EOF; the process exits normally on
-    return.
+    :func:`serve`. Returns on socket EOF; the process exits normally
+    on return.
     """
     reader = vcztools_cli.make_reader(vcz_url, backend_storage=backend_storage)
-    session = WorkerSession(reader, basename)
+    session = WorkerSession(reader)
     try:
         serve(sock, session)
     finally:
