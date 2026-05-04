@@ -13,13 +13,8 @@ import stat
 
 import pyfuse3
 import pytest
-import trio
 
 from biofuse import access_log, bed_protocol, plink_ops
-
-
-def run(coro):
-    return trio.run(lambda: coro)
 
 
 class _FakeClient:
@@ -95,9 +90,9 @@ def fx_ops(fx_client):
     return plink_ops.PlinkOps(fx_client)
 
 
-def _expect_fuse_error(coro, expected_errno):
+async def _expect_fuse_error(coro, expected_errno):
     with pytest.raises(pyfuse3.FUSEError) as excinfo:
-        run(coro)
+        await coro
     assert excinfo.value.errno == expected_errno
 
 
@@ -134,39 +129,41 @@ class TestConstructor:
 
 
 class TestGetattr:
-    def test_root(self, fx_ops):
-        attrs = run(fx_ops.getattr(pyfuse3.ROOT_INODE))
+    async def test_root(self, fx_ops):
+        attrs = await fx_ops.getattr(pyfuse3.ROOT_INODE)
         assert stat.S_ISDIR(attrs.st_mode)
 
-    def test_regular_file(self, fx_ops):
+    async def test_regular_file(self, fx_ops):
         inode = fx_ops._name_to_inode["small.bed"]
-        attrs = run(fx_ops.getattr(inode))
+        attrs = await fx_ops.getattr(inode)
         assert stat.S_ISREG(attrs.st_mode)
         assert attrs.st_size == 1024
 
-    def test_unknown_inode(self, fx_ops):
-        _expect_fuse_error(fx_ops.getattr(9999), errno.ENOENT)
+    async def test_unknown_inode(self, fx_ops):
+        await _expect_fuse_error(fx_ops.getattr(9999), errno.ENOENT)
 
 
 class TestLookup:
-    def test_known_name(self, fx_ops):
-        attrs = run(fx_ops.lookup(pyfuse3.ROOT_INODE, b"small.bed"))
+    async def test_known_name(self, fx_ops):
+        attrs = await fx_ops.lookup(pyfuse3.ROOT_INODE, b"small.bed")
         assert attrs.st_size == 1024
 
-    def test_unknown_name(self, fx_ops):
-        _expect_fuse_error(fx_ops.lookup(pyfuse3.ROOT_INODE, b"nope.bed"), errno.ENOENT)
+    async def test_unknown_name(self, fx_ops):
+        await _expect_fuse_error(
+            fx_ops.lookup(pyfuse3.ROOT_INODE, b"nope.bed"), errno.ENOENT
+        )
 
-    def test_invalid_utf8(self, fx_ops):
-        _expect_fuse_error(
+    async def test_invalid_utf8(self, fx_ops):
+        await _expect_fuse_error(
             fx_ops.lookup(pyfuse3.ROOT_INODE, b"\xff\xfe.bed"), errno.ENOENT
         )
 
-    def test_lookup_in_non_root(self, fx_ops):
-        _expect_fuse_error(fx_ops.lookup(2, b"small.bed"), errno.ENOENT)
+    async def test_lookup_in_non_root(self, fx_ops):
+        await _expect_fuse_error(fx_ops.lookup(2, b"small.bed"), errno.ENOENT)
 
 
 class TestReaddir:
-    def test_yields_three_entries_in_sorted_order(self, fx_ops):
+    async def test_yields_three_entries_in_sorted_order(self, fx_ops):
         emitted: list[tuple[str, int]] = []
 
         class FakeToken:
@@ -181,12 +178,12 @@ class TestReaddir:
         original = pyfuse3.readdir_reply
         pyfuse3.readdir_reply = fake_readdir_reply
         try:
-            run(fx_ops.readdir(pyfuse3.ROOT_INODE, 0, token))
+            await fx_ops.readdir(pyfuse3.ROOT_INODE, 0, token)
         finally:
             pyfuse3.readdir_reply = original
         assert [n for n, _ in emitted] == ["small.bed", "small.bim", "small.fam"]
 
-    def test_readdir_resumes_from_start_id(self, fx_ops):
+    async def test_readdir_resumes_from_start_id(self, fx_ops):
         emitted: list[str] = []
 
         def fake_readdir_reply(tok, name, attrs, next_id):
@@ -196,112 +193,114 @@ class TestReaddir:
         original = pyfuse3.readdir_reply
         pyfuse3.readdir_reply = fake_readdir_reply
         try:
-            run(fx_ops.readdir(pyfuse3.ROOT_INODE, 1, object()))
+            await fx_ops.readdir(pyfuse3.ROOT_INODE, 1, object())
         finally:
             pyfuse3.readdir_reply = original
         assert emitted == ["small.bim", "small.fam"]
 
 
 class TestOpenFlags:
-    def test_open_with_write_flag_returns_erofs(self, fx_ops):
+    async def test_open_with_write_flag_returns_erofs(self, fx_ops):
         inode = fx_ops._name_to_inode["small.bed"]
-        _expect_fuse_error(fx_ops.open(inode, os.O_WRONLY), errno.EROFS)
+        await _expect_fuse_error(fx_ops.open(inode, os.O_WRONLY), errno.EROFS)
 
-    def test_open_with_rdwr_flag_returns_erofs(self, fx_ops):
+    async def test_open_with_rdwr_flag_returns_erofs(self, fx_ops):
         inode = fx_ops._name_to_inode["small.bed"]
-        _expect_fuse_error(fx_ops.open(inode, os.O_RDWR), errno.EROFS)
+        await _expect_fuse_error(fx_ops.open(inode, os.O_RDWR), errno.EROFS)
 
-    def test_open_with_append_flag_returns_erofs(self, fx_ops):
+    async def test_open_with_append_flag_returns_erofs(self, fx_ops):
         inode = fx_ops._name_to_inode["small.bed"]
-        _expect_fuse_error(fx_ops.open(inode, os.O_RDONLY | os.O_APPEND), errno.EROFS)
+        await _expect_fuse_error(
+            fx_ops.open(inode, os.O_RDONLY | os.O_APPEND), errno.EROFS
+        )
 
-    def test_open_unknown_inode(self, fx_ops):
-        _expect_fuse_error(fx_ops.open(9999, os.O_RDONLY), errno.ENOENT)
+    async def test_open_unknown_inode(self, fx_ops):
+        await _expect_fuse_error(fx_ops.open(9999, os.O_RDONLY), errno.ENOENT)
 
 
 class TestOpenDispatch:
-    def test_open_calls_client_with_filename(self, fx_ops, fx_client):
+    async def test_open_calls_client_with_filename(self, fx_ops, fx_client):
         inode = fx_ops._name_to_inode["small.bed"]
-        info = run(fx_ops.open(inode, os.O_RDONLY))
+        info = await fx_ops.open(inode, os.O_RDONLY)
         try:
             assert ("open", "small.bed") in fx_client.calls
             assert info.fh in fx_ops._fh_to_handle
         finally:
-            run(fx_ops.release(info.fh))
+            await fx_ops.release(info.fh)
 
-    def test_each_open_gets_distinct_fh(self, fx_ops):
+    async def test_each_open_gets_distinct_fh(self, fx_ops):
         inode = fx_ops._name_to_inode["small.bed"]
-        info1 = run(fx_ops.open(inode, os.O_RDONLY))
-        info2 = run(fx_ops.open(inode, os.O_RDONLY))
+        info1 = await fx_ops.open(inode, os.O_RDONLY)
+        info2 = await fx_ops.open(inode, os.O_RDONLY)
         try:
             assert info1.fh != info2.fh
         finally:
-            run(fx_ops.release(info1.fh))
-            run(fx_ops.release(info2.fh))
+            await fx_ops.release(info1.fh)
+            await fx_ops.release(info2.fh)
 
-    def test_open_propagates_oserror_as_fuseerror(self, fx_ops, fx_client):
+    async def test_open_propagates_oserror_as_fuseerror(self, fx_ops, fx_client):
         fx_client.raise_on_next("open", OSError(errno.EACCES, "denied"))
         inode = fx_ops._name_to_inode["small.bed"]
-        _expect_fuse_error(fx_ops.open(inode, os.O_RDONLY), errno.EACCES)
+        await _expect_fuse_error(fx_ops.open(inode, os.O_RDONLY), errno.EACCES)
 
 
 class TestRead:
-    def test_read_dispatches_to_client(self, fx_ops, fx_client):
+    async def test_read_dispatches_to_client(self, fx_ops, fx_client):
         inode = fx_ops._name_to_inode["small.bed"]
-        info = run(fx_ops.open(inode, os.O_RDONLY))
+        info = await fx_ops.open(inode, os.O_RDONLY)
         try:
-            data = run(fx_ops.read(info.fh, 16, 8))
+            data = await fx_ops.read(info.fh, 16, 8)
             handle = fx_ops._fh_to_handle[info.fh]
             assert ("read", handle, 16, 8) in fx_client.calls
             assert data == bytes(((16 + i) & 0xFF) for i in range(8))
         finally:
-            run(fx_ops.release(info.fh))
+            await fx_ops.release(info.fh)
 
-    def test_read_unknown_fh_returns_ebadf(self, fx_ops):
-        _expect_fuse_error(fx_ops.read(9999, 0, 10), errno.EBADF)
+    async def test_read_unknown_fh_returns_ebadf(self, fx_ops):
+        await _expect_fuse_error(fx_ops.read(9999, 0, 10), errno.EBADF)
 
-    def test_read_propagates_oserror_as_fuseerror(self, fx_ops, fx_client):
+    async def test_read_propagates_oserror_as_fuseerror(self, fx_ops, fx_client):
         inode = fx_ops._name_to_inode["small.bed"]
-        info = run(fx_ops.open(inode, os.O_RDONLY))
+        info = await fx_ops.open(inode, os.O_RDONLY)
         try:
             fx_client.raise_on_next("read", OSError(errno.EIO, "boom"))
-            _expect_fuse_error(fx_ops.read(info.fh, 0, 10), errno.EIO)
+            await _expect_fuse_error(fx_ops.read(info.fh, 0, 10), errno.EIO)
         finally:
-            run(fx_ops.release(info.fh))
+            await fx_ops.release(info.fh)
 
 
 class TestRelease:
-    def test_release_dispatches_to_client(self, fx_ops, fx_client):
+    async def test_release_dispatches_to_client(self, fx_ops, fx_client):
         inode = fx_ops._name_to_inode["small.bed"]
-        info = run(fx_ops.open(inode, os.O_RDONLY))
+        info = await fx_ops.open(inode, os.O_RDONLY)
         handle = fx_ops._fh_to_handle[info.fh]
-        run(fx_ops.release(info.fh))
+        await fx_ops.release(info.fh)
         assert ("release", handle) in fx_client.calls
 
-    def test_release_unknown_fh_silent(self, fx_ops):
-        run(fx_ops.release(9999))
+    async def test_release_unknown_fh_silent(self, fx_ops):
+        await fx_ops.release(9999)
 
-    def test_release_is_idempotent(self, fx_ops):
+    async def test_release_is_idempotent(self, fx_ops):
         inode = fx_ops._name_to_inode["small.bed"]
-        info = run(fx_ops.open(inode, os.O_RDONLY))
-        run(fx_ops.release(info.fh))
-        run(fx_ops.release(info.fh))
+        info = await fx_ops.open(inode, os.O_RDONLY)
+        await fx_ops.release(info.fh)
+        await fx_ops.release(info.fh)
 
 
 class TestAccessLogger:
-    def test_records_per_read(self, fx_client):
+    async def test_records_per_read(self, fx_client):
         log = access_log.AccessLogger()
         ops = plink_ops.PlinkOps(fx_client, access_logger=log)
         bed_inode = ops._name_to_inode["small.bed"]
         bim_inode = ops._name_to_inode["small.bim"]
-        bed_info = run(ops.open(bed_inode, os.O_RDONLY))
-        bim_info = run(ops.open(bim_inode, os.O_RDONLY))
+        bed_info = await ops.open(bed_inode, os.O_RDONLY)
+        bim_info = await ops.open(bim_inode, os.O_RDONLY)
         try:
-            run(ops.read(bed_info.fh, 0, 100))
-            run(ops.read(bim_info.fh, 0, 50))
+            await ops.read(bed_info.fh, 0, 100)
+            await ops.read(bim_info.fh, 0, 50)
         finally:
-            run(ops.release(bed_info.fh))
-            run(ops.release(bim_info.fh))
+            await ops.release(bed_info.fh)
+            await ops.release(bim_info.fh)
         records = log.records
         bed_records = [r for r in records if r.path.endswith(".bed")]
         bim_records = [r for r in records if r.path.endswith(".bim")]
@@ -314,29 +313,29 @@ class TestAccessLogger:
 
 
 class TestReadOnly:
-    def test_access_write_denied(self, fx_ops):
+    async def test_access_write_denied(self, fx_ops):
         inode = fx_ops._name_to_inode["small.bed"]
-        _expect_fuse_error(fx_ops.access(inode, os.W_OK), errno.EROFS)
+        await _expect_fuse_error(fx_ops.access(inode, os.W_OK), errno.EROFS)
 
-    def test_access_read_allowed(self, fx_ops):
+    async def test_access_read_allowed(self, fx_ops):
         inode = fx_ops._name_to_inode["small.bed"]
-        run(fx_ops.access(inode, os.R_OK))
+        await fx_ops.access(inode, os.R_OK)
 
-    def test_access_unknown_inode(self, fx_ops):
-        _expect_fuse_error(fx_ops.access(9999, os.R_OK), errno.ENOENT)
+    async def test_access_unknown_inode(self, fx_ops):
+        await _expect_fuse_error(fx_ops.access(9999, os.R_OK), errno.ENOENT)
 
 
 class TestOpendir:
-    def test_root(self, fx_ops):
-        fh = run(fx_ops.opendir(pyfuse3.ROOT_INODE))
+    async def test_root(self, fx_ops):
+        fh = await fx_ops.opendir(pyfuse3.ROOT_INODE)
         assert fh == pyfuse3.ROOT_INODE
-        run(fx_ops.releasedir(fh))
+        await fx_ops.releasedir(fh)
 
-    def test_non_root_is_notdir(self, fx_ops):
+    async def test_non_root_is_notdir(self, fx_ops):
         inode = fx_ops._name_to_inode["small.bed"]
-        _expect_fuse_error(fx_ops.opendir(inode), errno.ENOTDIR)
+        await _expect_fuse_error(fx_ops.opendir(inode), errno.ENOTDIR)
 
 
 class TestForget:
-    def test_forget_is_noop(self, fx_ops):
-        run(fx_ops.forget([(2, 1), (3, 1)]))
+    async def test_forget_is_noop(self, fx_ops):
+        await fx_ops.forget([(2, 1), (3, 1)])

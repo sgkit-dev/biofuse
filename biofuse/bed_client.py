@@ -4,33 +4,22 @@
 exposes ``open / read / release`` to :class:`PlinkOps` over the wire
 protocol defined in :mod:`biofuse.bed_protocol`.
 
-Lifecycle
----------
+The client is fully trio-native: construction, RPCs, and shutdown all
+run inside a single ``trio.run`` scope (the CLI's main loop). The
+parent socket is wrapped as a :class:`trio.SocketStream` from the
+moment the worker is spawned; the LIST handshake, request/reply
+roundtrips, and graceful shutdown (``send_eof`` → ``aclose``) all use
+trio primitives.
 
-The client is constructed *before* the FUSE mount, while we are still in
-sync code:
-
-1. ``__init__`` spawns the worker via ``multiprocessing.get_context("spawn")``,
-   sets up an ``AF_UNIX`` ``SOCK_STREAM`` socketpair, and synchronously
-   issues a ``LIST`` request to obtain the file entries (sizes, modes).
-2. ``PlinkOps`` reads the file entries and populates its inode map.
-3. The FUSE mount starts; pyfuse3's main loop runs on a background thread
-   under ``trio.run``. On the first async request the client lazily wraps
-   the parent socket fd in a ``trio.lowlevel.FdStream``.
-4. On shutdown, ``close()`` is called from sync context after the trio
-   loop has terminated. It half-closes the connection so the worker
-   sees EOF, then joins the subprocess.
-
-The protocol is single-flight: a ``trio.Lock`` serialises requests so a
-failure on one in-flight call cannot corrupt the next frame.
+The protocol is single-flight: a :class:`trio.Lock` serialises
+requests so a failure on one in-flight call cannot corrupt the next
+frame.
 """
 
 import errno
 import logging
 import multiprocessing as mp
-import os
 import socket
-import threading
 
 import trio
 
@@ -45,26 +34,29 @@ _SHUTDOWN_GRACE_SECONDS = 5.0
 class BedEncoderClient:
     """Parent-side async client over a worker subprocess.
 
-    Parameters
-    ----------
-    vcz_url
-        The VCZ store URL, passed verbatim to ``vcztools.cli.make_reader``
-        in the worker.
-    basename
-        Stem for the three exposed files.
-    backend_storage
-        Optional ``vcztools`` backend-storage selector. ``None`` lets
-        ``make_reader`` choose its default.
+    Construct via :meth:`BedEncoderClient.connect` (an async classmethod
+    that spawns the worker, performs the LIST handshake, and returns
+    the ready client). The instance is also an async context manager:
+    ``async with await BedEncoderClient.connect(...) as client: ...``
+    will call :meth:`aclose` on exit.
     """
 
-    def __init__(
-        self,
+    @classmethod
+    async def connect(
+        cls,
         vcz_url: str,
         basename: str,
         *,
         backend_storage: str | None = None,
-    ) -> None:
+    ) -> "BedEncoderClient":
+        """Spawn the worker, do the LIST handshake, return a ready client."""
         ctx = mp.get_context("spawn")
+        # socket.socketpair is a ~10 us kernel allocation (not I/O);
+        # proc.start() blocks for ~10 ms on fork+exec+bootstrap. Both
+        # are fine sync here: connect() is one-time setup, run before
+        # the FUSE mount is live, so no concurrent trio task needs the
+        # loop. Wrap proc.start() in trio.to_thread.run_sync only if
+        # we ever start spawning workers from inside a busy loop.
         parent_sock, child_sock = socket.socketpair(
             socket.AF_UNIX, socket.SOCK_STREAM
         )
@@ -79,36 +71,37 @@ class BedEncoderClient:
             # multiprocessing's socket reduction has duplicated the fd
             # into the child; the parent's copy of the child end can go.
             child_sock.close()
-        self._init_from_socket(parent_sock, proc)
+        stream = trio.SocketStream(trio.socket.from_stdlib_socket(parent_sock))
+        return await cls._from_stream(stream, proc)
 
     @classmethod
-    def _for_test(cls, parent_sock: socket.socket, proc) -> "BedEncoderClient":
-        """Construct a client around a preconnected socket+process.
+    async def _from_stream(cls, stream: trio.SocketStream, proc) -> "BedEncoderClient":
+        """Construct a client around a preconnected stream + process.
 
         Test seam: lets tests pair the client with a ``serve()`` running
         in a thread on the other end of a ``socket.socketpair`` instead
         of a real subprocess. ``proc`` only needs to expose
         ``is_alive()``, ``join(timeout)``, ``terminate()``, ``kill()``.
         """
-        instance = cls.__new__(cls)
-        instance._init_from_socket(parent_sock, proc)
-        return instance
-
-    def _init_from_socket(self, parent_sock: socket.socket, proc) -> None:
+        self = cls.__new__(cls)
+        self._stream = stream
         self._proc = proc
-        self._parent_sock: socket.socket | None = parent_sock
-        # Snapshot the fd so close() can release it via os.close() even
-        # after the socket has been detached for the trio FdStream.
-        self._fd: int | None = parent_sock.fileno()
-        self._stream: trio.lowlevel.FdStream | None = None
         self._lock = trio.Lock()
-        self._sync_lock = threading.Lock()
         self._closed = False
         try:
-            self._file_entries: list[bed_protocol.FileSpec] = self._handshake_list()
+            self._file_entries = await self._handshake_list()
         except BaseException:
-            self.close()
+            await self.aclose()
             raise
+        return self
+
+    # -- async context manager ------------------------------------------
+
+    async def __aenter__(self) -> "BedEncoderClient":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.aclose()
 
     # -- public API ------------------------------------------------------
 
@@ -130,17 +123,16 @@ class BedEncoderClient:
         """Read ``size`` bytes at ``offset`` for ``handle``."""
         request = bed_protocol.pack_read_request(handle, offset, size)
         async with self._lock:
-            stream = await self._ensure_stream()
-            await stream.send_all(request)
-            status_buf = await _recv_exact_async(
-                stream, bed_protocol.REPLY_STATUS_SIZE
+            await self._stream.send_all(request)
+            status_buf = await _recv_exact(
+                self._stream, bed_protocol.REPLY_STATUS_SIZE
             )
             status = bed_protocol.parse_status(status_buf)
             if status < 0:
                 raise bed_protocol.status_to_error(status)
             if status == 0:
                 return b""
-            return await _recv_exact_async(stream, status)
+            return await _recv_exact(self._stream, status)
 
     async def release(self, handle: int) -> None:
         """Release ``handle`` in the worker."""
@@ -149,20 +141,65 @@ class BedEncoderClient:
         if status < 0:
             raise bed_protocol.status_to_error(status)
 
-    def close(self) -> None:
-        """Tear down the worker subprocess. Idempotent. Sync-callable.
+    async def aclose(self) -> None:
+        """Tear down the worker subprocess. Idempotent.
 
-        Sends EOF to the worker by shutting the socket down, joins the
-        process for a short grace period, then escalates to SIGTERM and
-        SIGKILL if it refuses to exit.
+        Half-closes the write side so the worker's ``recv`` loop sees
+        EOF and exits, then fully closes the stream and joins the
+        subprocess. Escalates to SIGTERM and SIGKILL if the worker
+        refuses to exit within the grace period.
         """
-        with self._sync_lock:
-            if self._closed:
-                return
-            self._closed = True
-            self._send_eof_to_worker()
-            self._parent_sock = None
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._stream.send_eof()
+        except (trio.ClosedResourceError, trio.BrokenResourceError, OSError) as exc:
+            logger.debug("send_eof on bed-worker stream raised: %s", exc)
+        await self._stream.aclose()
+        await trio.to_thread.run_sync(self._sync_join_proc)
 
+    # -- internals -------------------------------------------------------
+
+    async def _roundtrip(
+        self, request: bytes, *, body_size: int
+    ) -> tuple[int, bytes]:
+        async with self._lock:
+            await self._stream.send_all(request)
+            status_buf = await _recv_exact(
+                self._stream, bed_protocol.REPLY_STATUS_SIZE
+            )
+            status = bed_protocol.parse_status(status_buf)
+            if status < 0:
+                return status, b""
+            if body_size == 0:
+                return status, b""
+            body = await _recv_exact(self._stream, body_size)
+            return status, body
+
+    async def _handshake_list(self) -> list[bed_protocol.FileSpec]:
+        await self._stream.send_all(bed_protocol.pack_list_request())
+        status_buf = await _recv_exact(
+            self._stream, bed_protocol.REPLY_STATUS_SIZE
+        )
+        status = bed_protocol.parse_status(status_buf)
+        if status < 0:
+            raise bed_protocol.status_to_error(status)
+        entries: list[bed_protocol.FileSpec] = []
+        for _ in range(status):
+            hdr = await _recv_exact(
+                self._stream, bed_protocol.REPLY_LIST_ENTRY_HDR_SIZE
+            )
+            name_len, size, mode = bed_protocol.parse_list_entry_header(hdr)
+            name_bytes = (
+                await _recv_exact(self._stream, name_len) if name_len > 0 else b""
+            )
+            entries.append(
+                bed_protocol.FileSpec(name_bytes.decode("utf-8"), size, mode)
+            )
+        return entries
+
+    def _sync_join_proc(self) -> None:
         if self._proc.is_alive():
             self._proc.join(timeout=_SHUTDOWN_GRACE_SECONDS)
         if self._proc.is_alive():
@@ -174,111 +211,12 @@ class BedEncoderClient:
             self._proc.kill()
             self._proc.join(timeout=_SHUTDOWN_GRACE_SECONDS)
 
-    def _send_eof_to_worker(self) -> None:
-        """Half-close the connection so the worker's recv returns 0.
 
-        If no FdStream has been created yet, ``_parent_sock`` still owns
-        the fd and we can close it directly. Otherwise the fd is owned
-        by the FdStream; we ``os.dup()`` it, shut the dup down, and
-        close the dup. The original fd stays valid for the FdStream's
-        garbage-collection cleanup, so we don't trigger the spurious
-        EBADF that an outright ``os.close()`` would cause.
-        """
-        if self._parent_sock is not None:
-            try:
-                self._parent_sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            self._parent_sock.close()
-            return
-        if self._fd is None:
-            return
-        try:
-            dup_fd = os.dup(self._fd)
-        except OSError as exc:
-            logger.debug("os.dup on bed-worker fd raised: %s", exc)
-            return
-        try:
-            with socket.socket(fileno=dup_fd) as wrap:
-                try:
-                    wrap.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-        except OSError as exc:
-            logger.debug("shutdown on bed-worker fd raised: %s", exc)
-
-    # -- internals -------------------------------------------------------
-
-    async def _roundtrip(
-        self, request: bytes, *, body_size: int
-    ) -> tuple[int, bytes]:
-        async with self._lock:
-            stream = await self._ensure_stream()
-            await stream.send_all(request)
-            status_buf = await _recv_exact_async(
-                stream, bed_protocol.REPLY_STATUS_SIZE
-            )
-            status = bed_protocol.parse_status(status_buf)
-            if status < 0:
-                return status, b""
-            if body_size == 0:
-                return status, b""
-            body = await _recv_exact_async(stream, body_size)
-            return status, body
-
-    async def _ensure_stream(self) -> trio.lowlevel.FdStream:
-        if self._stream is not None:
-            return self._stream
-        if self._closed or self._parent_sock is None:
-            raise OSError(errno.EIO, "bed-worker client is closed")
-        # detach() returns the same fd integer we already snapshotted in
-        # self._fd; the socket is now invalid but the fd is owned by
-        # FdStream. close() will release it via os.close(self._fd).
-        fd = self._parent_sock.detach()
-        self._parent_sock = None
-        self._stream = trio.lowlevel.FdStream(fd)
-        return self._stream
-
-    # -- synchronous handshake ------------------------------------------
-
-    def _handshake_list(self) -> list[bed_protocol.FileSpec]:
-        assert self._parent_sock is not None
-        sock = self._parent_sock
-        sock.sendall(bed_protocol.pack_list_request())
-        status_buf = _recv_exact_sync(sock, bed_protocol.REPLY_STATUS_SIZE)
-        status = bed_protocol.parse_status(status_buf)
-        if status < 0:
-            raise bed_protocol.status_to_error(status)
-        entries: list[bed_protocol.FileSpec] = []
-        for _ in range(status):
-            hdr = _recv_exact_sync(sock, bed_protocol.REPLY_LIST_ENTRY_HDR_SIZE)
-            name_len, size, mode = bed_protocol.parse_list_entry_header(hdr)
-            name_bytes = _recv_exact_sync(sock, name_len) if name_len > 0 else b""
-            entries.append(
-                bed_protocol.FileSpec(name_bytes.decode("utf-8"), size, mode)
-            )
-        return entries
-
-
-def _recv_exact_sync(sock: socket.socket, n: int) -> bytes:
-    if n == 0:
-        return b""
-    buf = bytearray(n)
-    view = memoryview(buf)
-    got = 0
-    while got < n:
-        chunk = sock.recv_into(view[got:], n - got)
-        if chunk == 0:
-            raise EOFError("worker closed socket during handshake")
-        got += chunk
-    return bytes(buf)
-
-
-async def _recv_exact_async(stream: trio.lowlevel.FdStream, n: int) -> bytes:
+async def _recv_exact(stream: trio.SocketStream, n: int) -> bytes:
     """Read exactly ``n`` bytes off ``stream``, with a guaranteed checkpoint.
 
-    Loops over ``stream.receive_some``; raises ``OSError(EIO)`` on EOF,
-    which the caller surfaces to the FUSE layer as ``FUSEError(EIO)``.
+    Raises :class:`OSError(EIO)` on EOF, which the caller surfaces to
+    the FUSE layer as ``FUSEError(EIO)``.
     """
     if n == 0:
         await trio.lowlevel.checkpoint()

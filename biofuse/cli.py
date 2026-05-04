@@ -4,10 +4,10 @@ import logging
 import pathlib
 import signal
 import sys
-import threading
 from functools import wraps
 
 import click
+import trio
 
 from biofuse import access_log, bed_client, fuse_adapter, plink_ops
 
@@ -109,34 +109,39 @@ def mount_plink(
     log_path = pathlib.Path(access_log_path) if access_log_path is not None else None
     resolved_basename = basename if basename is not None else _default_basename(vcz_url)
 
-    client = bed_client.BedEncoderClient(
-        vcz_url, resolved_basename, backend_storage=backend_storage
+    trio.run(
+        _amount,
+        vcz_url,
+        str(mount_dir_path),
+        resolved_basename,
+        backend_storage,
+        log_path,
     )
-    try:
+
+
+async def _amount(
+    vcz_url: str,
+    mount_dir: str,
+    basename: str,
+    backend_storage: str | None,
+    log_path: pathlib.Path | None,
+) -> None:
+    async with await bed_client.BedEncoderClient.connect(
+        vcz_url, basename, backend_storage=backend_storage
+    ) as client:
         with access_log.AccessLogger(log_path) as access_logger:
             ops = plink_ops.PlinkOps(client, access_logger=access_logger)
-            with fuse_adapter.Mount(ops, str(mount_dir_path)):
-                click.echo(f"mounted at {mount_dir_path}", err=True)
-                _wait_for_signal()
+            async with fuse_adapter.mount(ops, mount_dir):
+                click.echo(f"mounted at {mount_dir}", err=True)
+                await _wait_for_signal()
                 click.echo("unmounting", err=True)
-    finally:
-        client.close()
 
 
-def _wait_for_signal() -> None:
-    """Block the calling thread until SIGINT or SIGTERM is received."""
-    stop = threading.Event()
-
-    def handler(signum, frame):
-        stop.set()
-
-    previous_int = signal.signal(signal.SIGINT, handler)
-    previous_term = signal.signal(signal.SIGTERM, handler)
-    try:
-        stop.wait()
-    finally:
-        signal.signal(signal.SIGINT, previous_int)
-        signal.signal(signal.SIGTERM, previous_term)
+async def _wait_for_signal() -> None:
+    """Return on first SIGINT or SIGTERM."""
+    with trio.open_signal_receiver(signal.SIGINT, signal.SIGTERM) as signals:
+        async for _ in signals:
+            return
 
 
 if __name__ == "__main__":

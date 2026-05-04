@@ -2,14 +2,15 @@
 
 pyfuse3 keeps mount state in module-level globals (``pyfuse3.init`` /
 ``pyfuse3.main`` / ``pyfuse3.close``), so only one biofuse mount can
-be active per process at a time. The :class:`Mount` context manager
-enforces this implicitly by being the only entry point.
+be active per process at a time. The :func:`mount` async context
+manager enforces this implicitly by being the only entry point.
 """
 
 import logging
 import shutil
 import subprocess
 import threading
+from contextlib import asynccontextmanager
 
 import pyfuse3
 import trio
@@ -17,100 +18,60 @@ import trio
 logger = logging.getLogger(__name__)
 
 
-class Mount:
-    """Context manager that mounts a pyfuse3.Operations via pyfuse3.
+_global_lock = threading.Lock()
 
-    Mounts on ``__enter__``, runs the FUSE main loop on a background thread,
-    and unmounts cleanly on ``__exit__``.
 
-    The caller owns the lifecycle of the operations object: ``Mount`` does
-    not construct or close it.
+@asynccontextmanager
+async def mount(
+    operations: pyfuse3.Operations,
+    mountpoint: str,
+    *,
+    fsname: str = "biofuse",
+    debug_fuse: bool = False,
+):
+    """Mount ``operations`` at ``mountpoint`` and run pyfuse3.main.
 
-    pyfuse3's mount state is process-global, so only one Mount may be live
-    in a given Python process at a time.
+    The pyfuse3 main loop runs as a child task in a trio nursery
+    inside this manager's scope. Exiting the ``async with`` block
+    terminates pyfuse3 and unmounts cleanly via fusermount3.
     """
-
-    _global_lock = threading.Lock()
-    _active: "Mount | None" = None
-
-    def __init__(
-        self,
-        operations: pyfuse3.Operations,
-        mountpoint: str,
-        *,
-        fsname: str = "biofuse",
-        debug_fuse: bool = False,
-    ) -> None:
-        self._operations = operations
-        self._mountpoint = mountpoint
-        self._fsname = fsname
-        self._debug_fuse = debug_fuse
-        self._thread: threading.Thread | None = None
-        self._exception: BaseException | None = None
-        self._closed = False
-
-    def __enter__(self) -> str:
-        if not Mount._global_lock.acquire(blocking=False):
-            raise RuntimeError(
-                "another biofuse Mount is active in this process; "
-                "pyfuse3 supports only one mount at a time"
-            )
-        try:
-            options = set(pyfuse3.default_options)
-            options.add(f"fsname={self._fsname}")
-            options.add("ro")
-            if self._debug_fuse:
-                options.add("debug")
-            pyfuse3.init(self._operations, self._mountpoint, options)
-        except BaseException:
-            Mount._global_lock.release()
-            raise
-
-        self._thread = threading.Thread(
-            target=self._run, name="biofuse-fuse-main", daemon=True
+    if not _global_lock.acquire(blocking=False):
+        raise RuntimeError(
+            "another biofuse mount is active in this process; "
+            "pyfuse3 supports only one mount at a time"
         )
-        self._thread.start()
-        Mount._active = self
-        return self._mountpoint
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.close()
-
-    def _run(self) -> None:
+    try:
+        options = set(pyfuse3.default_options)
+        options.add(f"fsname={fsname}")
+        options.add("ro")
+        if debug_fuse:
+            options.add("debug")
+        pyfuse3.init(operations, mountpoint, options)
         try:
-            trio.run(pyfuse3.main)
-        except BaseException as e:
-            self._exception = e
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            try:
-                pyfuse3.terminate()
-            except Exception as exc:
-                logger.debug("pyfuse3.terminate raised: %s", exc)
-            # pyfuse3.terminate only marks the loop for exit; the loop is
-            # blocked in the kernel waiting for the next request, so it does
-            # not actually exit until the kernel sends one. Run fusermount3
-            # -u to unmount (which generates an UMOUNT request and wakes the
-            # loop). The lazy flag (-z) ensures the call returns even if
-            # processes still hold open file handles.
-            _force_unmount(self._mountpoint)
-            if self._thread is not None:
-                self._thread.join(timeout=15)
-                if self._thread.is_alive():
-                    logger.warning("FUSE main loop did not terminate within 15s")
+            async with trio.open_nursery() as nursery:
+                nursery.start_soon(pyfuse3.main)
+                try:
+                    yield mountpoint
+                finally:
+                    try:
+                        pyfuse3.terminate()
+                    except Exception as exc:
+                        logger.debug("pyfuse3.terminate raised: %s", exc)
+                    # pyfuse3.terminate only flags the loop for exit;
+                    # it does not actually wake the kernel-blocked
+                    # main loop until the kernel sends a request.
+                    # fusermount3 -u generates an UMOUNT request that
+                    # wakes the loop. -z (lazy) returns even if
+                    # processes still hold open file handles.
+                    _force_unmount(mountpoint)
+                # Nursery exit waits for pyfuse3.main to return.
+        finally:
             try:
                 pyfuse3.close(unmount=False)
             except Exception as exc:
                 logger.debug("pyfuse3.close raised: %s", exc)
-        finally:
-            Mount._active = None
-            Mount._global_lock.release()
-        if self._exception is not None:
-            raise self._exception
+    finally:
+        _global_lock.release()
 
 
 def _force_unmount(mountpoint: str) -> None:

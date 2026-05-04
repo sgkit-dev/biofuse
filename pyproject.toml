@@ -41,6 +41,7 @@ biofuse = "biofuse.cli:biofuse_main"
 test = [
   "pytest",
   "pytest-cov",
+  "pytest-trio",
   "pytest-xdist",
   "bio2zarr[vcf]",
   "msprime",
@@ -69,6 +70,7 @@ packages = ["biofuse"]
 [tool.pytest.ini_options]
 addopts = "-n auto"
 testpaths = ["tests"]
+trio_mode = true
 
 [tool.setuptools_scm]
 write_to = "biofuse/_version.py"
