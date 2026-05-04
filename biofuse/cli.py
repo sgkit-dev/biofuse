@@ -9,14 +9,7 @@ from functools import wraps
 
 import click
 
-from biofuse import (
-    access_log,
-    bed_client,
-    fuse_adapter,
-    passthrough_view,
-    plink_ops,
-    plink_source,
-)
+from biofuse import access_log, bed_client, fuse_adapter, plink_ops
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +33,16 @@ def handle_exception(func):
             raise click.ClickException(str(e)) from e
 
     return wrapper
+
+
+def _default_basename(vcz_url: str) -> str:
+    """Strip every suffix off ``vcz_url`` to get a plink fileset stem."""
+    name = pathlib.Path(vcz_url).name
+    while True:
+        stem = pathlib.Path(name).stem
+        if stem == name:
+            return stem
+        name = stem
 
 
 verbose = click.option(
@@ -91,60 +94,9 @@ def mount_plink(
 ):
     """Mount a PLINK 1.9 view of VCZ_URL at MOUNT_DIR.
 
-    The mount runs in the foreground until interrupted with Ctrl-C.
-    """
-    _setup_logging(verbose)
-
-    mount_dir_path = pathlib.Path(mount_dir)
-    if not mount_dir_path.is_dir():
-        raise click.ClickException(f"mount directory does not exist: {mount_dir}")
-
-    log_path = pathlib.Path(access_log_path) if access_log_path is not None else None
-
-    source = plink_source.PlinkSource(
-        vcz_url, basename=basename, backend_storage=backend_storage
-    )
-    backing_dir = source.open()
-    try:
-        click.echo(
-            f"materialised plink fileset for {vcz_url} ({source.basename})",
-            err=True,
-        )
-        with access_log.AccessLogger(log_path) as access_logger:
-            view = passthrough_view.PassthroughDirectoryView(
-                backing_dir, access_logger=access_logger
-            )
-            try:
-                ops = fuse_adapter.BiofuseOperations(view)
-                with fuse_adapter.Mount(ops, str(mount_dir_path)):
-                    click.echo(f"mounted at {mount_dir_path}", err=True)
-                    _wait_for_signal()
-                    click.echo("unmounting", err=True)
-            finally:
-                view.close()
-    finally:
-        source.close()
-
-
-@biofuse_main.command(name="mount-plink-streaming")
-@click.argument("vcz_url", type=str)
-@click.argument(
-    "mount_dir",
-    type=click.Path(file_okay=False, dir_okay=True, path_type=str),
-)
-@basename_opt
-@backend_storage
-@access_log_opt
-@verbose
-@handle_exception
-def mount_plink_streaming(
-    vcz_url, mount_dir, basename, backend_storage, access_log_path, verbose
-):
-    """Mount a streaming PLINK 1.9 view of VCZ_URL at MOUNT_DIR.
-
-    Unlike ``mount-plink``, this serves ``.bed`` on demand via
-    ``vcztools.BedEncoder`` (no upfront materialisation). The ``.bim`` and
-    ``.fam`` files are computed once at mount time and held in memory.
+    Serves ``.bed`` on demand via a worker subprocess running
+    ``vcztools.BedEncoder``; ``.bim`` and ``.fam`` are computed once at
+    mount time and held in the worker's memory.
 
     The mount runs in the foreground until interrupted with Ctrl-C.
     """
@@ -155,9 +107,7 @@ def mount_plink_streaming(
         raise click.ClickException(f"mount directory does not exist: {mount_dir}")
 
     log_path = pathlib.Path(access_log_path) if access_log_path is not None else None
-    resolved_basename = (
-        basename if basename is not None else plink_source.default_basename(vcz_url)
-    )
+    resolved_basename = basename if basename is not None else _default_basename(vcz_url)
 
     client = bed_client.BedEncoderClient(
         vcz_url, resolved_basename, backend_storage=backend_storage
@@ -166,7 +116,7 @@ def mount_plink_streaming(
         with access_log.AccessLogger(log_path) as access_logger:
             ops = plink_ops.PlinkOps(client, access_logger=access_logger)
             with fuse_adapter.Mount(ops, str(mount_dir_path)):
-                click.echo(f"mounted at {mount_dir_path} (streaming)", err=True)
+                click.echo(f"mounted at {mount_dir_path}", err=True)
                 _wait_for_signal()
                 click.echo("unmounting", err=True)
     finally:

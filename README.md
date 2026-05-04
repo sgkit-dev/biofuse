@@ -6,11 +6,10 @@ via a FUSE filesystem. The first supported view is **PLINK 1.9 binary**
 
 ## Status
 
-Phase 1 / pre-release. The current implementation materialises a complete
-PLINK fileset to a temporary directory at mount time using
-[`vcztools.plink.write_plink`](https://github.com/sgkit-dev/vcztools) and
-serves the directory through FUSE. A future phase will replace the
-materialisation step with a streaming source.
+Pre-release. The mount serves `.bed` on demand via a worker subprocess
+running [`vcztools.BedEncoder`](https://github.com/sgkit-dev/vcztools);
+`.bim` and `.fam` are computed once at mount time and held in the
+worker's memory.
 
 The mounted view is read-only and supports the access patterns of `plink1.9`
 and `plink2` for typical analysis commands (`--freq`, `--missing`, `--hardy`,
@@ -65,20 +64,13 @@ fusermount3 -u /tmp/plink-mnt
 ```bash
 uv sync --group dev
 uv run pytest             # full suite
-uv run pytest tests/test_passthrough_view.py  # one module
+uv run pytest tests/test_bed_worker.py  # one module
 uv run prek install       # install git pre-commit hook (one-off)
 uv run --only-group=lint prek -c prek.toml run --all-files
 ```
 
-## Roadmap
-
-- **Phase 2 — streaming plink source.** The materialisation step in
-  phase 1 doesn't scale to large remote VCZ stores. The replacement
-  is a streaming source in `vcztools` that biofuse calls byte-range
-  reads against. The consumer-driven requirements spec lives at
-  [`specs/vcztools_streaming_plink.md`](specs/vcztools_streaming_plink.md);
-  the empirical basis is the IO study at
-  [`experiments/io-study/report.md`](experiments/io-study/report.md).
+The streaming source spec lives at
+[`specs/vcztools_streaming_plink.md`](specs/vcztools_streaming_plink.md).
 
 ## Licence
 

@@ -22,14 +22,7 @@ import pytest
 from vcztools.cli import make_reader
 from vcztools.plink import write_plink
 
-from biofuse import (
-    access_log,
-    bed_client,
-    fuse_adapter,
-    passthrough_view,
-    plink_ops,
-    plink_source,
-)
+from biofuse import access_log, bed_client, fuse_adapter, plink_ops
 
 PLINK1 = shutil.which("plink1.9") or shutil.which("plink")
 PLINK2 = shutil.which("plink2")
@@ -47,15 +40,13 @@ def _wait_for_mount(mnt: pathlib.Path, timeout: float = 5.0) -> None:
     raise RuntimeError(f"mountpoint {mnt} not live after {timeout}s")
 
 
-@pytest.fixture(params=["passthrough", "streaming"])
-def fx_mounted_plink(request, tmp_path, fx_medium_vcz):
-    """Mount the medium VCZ as a plink fileset via biofuse, parametrised
-    over both phase 1 (passthrough) and phase 2 (streaming) backends.
+@pytest.fixture
+def fx_mounted_plink(tmp_path, fx_medium_vcz):
+    """Mount the medium VCZ as a plink fileset via biofuse.
 
     Yields ``(mnt, basename, golden_dir, log)`` where ``golden_dir`` holds a
     directly-materialised version of the same fileset for byte-comparison.
     """
-    mode = request.param
     mnt = tmp_path / "mnt"
     mnt.mkdir()
     golden = tmp_path / "golden_dir"
@@ -64,18 +55,8 @@ def fx_mounted_plink(request, tmp_path, fx_medium_vcz):
     write_plink(make_reader(str(fx_medium_vcz.path)), golden / "medium")
 
     log = access_log.AccessLogger()
-    cleanups: list = []
-    if mode == "passthrough":
-        source = plink_source.PlinkSource(fx_medium_vcz.path)
-        backing = source.open()
-        view = passthrough_view.PassthroughDirectoryView(backing, access_logger=log)
-        ops = fuse_adapter.BiofuseOperations(view)
-        cleanups.append(view.close)
-        cleanups.append(source.close)
-    else:
-        client = bed_client.BedEncoderClient(str(fx_medium_vcz.path), "medium")
-        ops = plink_ops.PlinkOps(client, access_logger=log)
-        cleanups.append(client.close)
+    client = bed_client.BedEncoderClient(str(fx_medium_vcz.path), "medium")
+    ops = plink_ops.PlinkOps(client, access_logger=log)
 
     mount = fuse_adapter.Mount(ops, str(mnt))
     mount.__enter__()
@@ -84,8 +65,7 @@ def fx_mounted_plink(request, tmp_path, fx_medium_vcz):
         yield mnt, "medium", golden, log
     finally:
         mount.__exit__(None, None, None)
-        for cleanup in cleanups:
-            cleanup()
+        client.close()
 
 
 def _run(cmd, **kwargs) -> subprocess.CompletedProcess:

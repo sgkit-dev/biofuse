@@ -74,11 +74,7 @@ REPLY_LIST_ENTRY_HDR_SIZE = _REPLY_LIST_ENTRY_HDR.size  # 16
 
 @dataclass(frozen=True)
 class FileSpec:
-    """Description of a file the worker can serve.
-
-    Mirrors ``biofuse.view.FileEntry`` but lives in the protocol layer to
-    keep that layer free of intra-package imports.
-    """
+    """Description of a file the worker can serve."""
 
     name: str
     size: int

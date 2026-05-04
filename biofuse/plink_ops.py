@@ -12,9 +12,6 @@ Design notes:
   metadata I/O and all ``BedEncoder`` state live in the worker.
 - A FUSE handle (``fh``) maps 1:1 to a worker handle. ``open()`` asks
   the client for a fresh worker handle; ``release()`` releases it.
-- The flat-directory bookkeeping (``getattr``/``lookup``/``readdir``/
-  ``access``) mirrors :class:`BiofuseOperations`: the only file-data
-  difference is that reads go through the client.
 """
 
 import errno
@@ -28,7 +25,6 @@ import pyfuse3
 
 from biofuse import access_log as access_log_mod
 from biofuse import bed_protocol
-from biofuse import view as view_mod
 
 logger = logging.getLogger(__name__)
 
@@ -79,18 +75,10 @@ class PlinkOps(pyfuse3.Operations):
         self._gid = os.getgid()
         self._lock = threading.Lock()
 
-        entries = sorted(
-            (
-                view_mod.FileEntry(
-                    name=spec.name, size=spec.size, mtime_ns=0, mode=spec.mode
-                )
-                for spec in client.file_entries
-            ),
-            key=lambda e: e.name,
-        )
+        entries = sorted(client.file_entries, key=lambda spec: spec.name)
         self._inode_to_name: dict[int, str] = {}
         self._name_to_inode: dict[str, int] = {}
-        self._inode_to_entry: dict[int, view_mod.FileEntry] = {}
+        self._inode_to_entry: dict[int, bed_protocol.FileSpec] = {}
         for index, entry in enumerate(entries):
             inode = pyfuse3.ROOT_INODE + 1 + index
             self._inode_to_name[inode] = entry.name
@@ -109,15 +97,13 @@ class PlinkOps(pyfuse3.Operations):
         if inode == pyfuse3.ROOT_INODE:
             attrs.st_mode = stat.S_IFDIR | 0o555
             attrs.st_size = 0
-            stamp = 0
         else:
             entry = self._inode_to_entry[inode]
             attrs.st_mode = entry.mode
             attrs.st_size = entry.size
-            stamp = entry.mtime_ns
-        attrs.st_atime_ns = stamp
-        attrs.st_ctime_ns = stamp
-        attrs.st_mtime_ns = stamp
+        attrs.st_atime_ns = 0
+        attrs.st_ctime_ns = 0
+        attrs.st_mtime_ns = 0
         return attrs
 
     async def getattr(self, inode, ctx=None):

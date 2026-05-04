@@ -57,11 +57,6 @@ packaging = [
   "validate-pyproject[all]",
 ]
 
-# Used by experiments/io-study; not required for runtime biofuse.
-experiments = [
-  "bed-reader",
-]
-
 dev = [
   {include-group = "test"},
   {include-group = "lint"},
