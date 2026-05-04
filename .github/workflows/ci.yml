@@ -6,6 +6,9 @@ on:
   push:
     branches:
       - main
+  schedule:
+    # At 04:44 on Monday, see https://crontab.guru/
+    - cron: "44 4 * * 1"
 
 permissions:
   contents: read
@@ -15,12 +18,12 @@ jobs:
     name: Lint
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           persist-credentials: false
 
       - name: Install uv and set the python version
-        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
         with:
           python-version: "3.11"
 
@@ -40,8 +43,9 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Install system packages
@@ -52,41 +56,60 @@ jobs:
               plink1.9 plink2
 
       - name: Install uv
-        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --group test
+        run: uv sync --locked --group test --no-default-groups
+
+      - name: Test console script entry point
+        run: |
+          uv run biofuse --help
 
       - name: Run tests with coverage
         run: uv run pytest --cov=biofuse --cov-report=term-missing
 
+      - name: Upload coverage to Coveralls
+        uses: coverallsapp/github-action@648a8eb78e6d50909eff900e4ec85cab4524a45b  # v2.3.6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # The first coveralls upload will succeed and others seem to fail now.
+          # This is a quick workaround for doing a proper "parallel" setup:
+          # https://github.com/coverallsapp/github-action
+          fail-on-error: false
+
   packaging:
     name: Packaging
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Install system packages
-        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev pkg-config
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
+      - name: Install uv and set the python version
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
         with:
           python-version: "3.12"
 
       - name: Install packaging deps
-        run: uv sync --group packaging --no-default-groups
+        run: uv sync --locked --group packaging --no-default-groups
 
       - name: Validate pyproject
-        run: uv run validate-pyproject pyproject.toml -v
+        run: uv run --locked --group packaging --no-default-groups validate-pyproject pyproject.toml -v
 
       - name: Build artefacts
         run: uv build
 
       - name: Twine check
-        run: uv run twine check --strict dist/*
+        run: uv run --locked --group packaging --no-default-groups twine check --strict dist/*
+
+      - name: Install into venv
+        run: |
+          uv venv cli-test
+          uv pip install --python=cli-test dist/*.whl
+
+      - name: Check biofuse CLI
+        run: |
+          ./cli-test/bin/biofuse --help
