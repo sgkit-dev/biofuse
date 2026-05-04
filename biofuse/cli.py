@@ -4,19 +4,12 @@ import logging
 import pathlib
 import signal
 import sys
-import threading
 from functools import wraps
 
 import click
-from vcztools import cli as vcztools_cli
+import trio
 
-from biofuse import (
-    access_log,
-    fuse_adapter,
-    passthrough_view,
-    plink_ops,
-    plink_source,
-)
+from biofuse import access_log, bed_client, fuse_adapter, plink_ops
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +33,16 @@ def handle_exception(func):
             raise click.ClickException(str(e)) from e
 
     return wrapper
+
+
+def _default_basename(vcz_url: str) -> str:
+    """Strip every suffix off ``vcz_url`` to get a plink fileset stem."""
+    name = pathlib.Path(vcz_url).name
+    while True:
+        stem = pathlib.Path(name).stem
+        if stem == name:
+            return stem
+        name = stem
 
 
 verbose = click.option(
@@ -91,6 +94,10 @@ def mount_plink(
 ):
     """Mount a PLINK 1.9 view of VCZ_URL at MOUNT_DIR.
 
+    Serves ``.bed`` on demand via a worker subprocess running
+    ``vcztools.BedEncoder``; ``.bim`` and ``.fam`` are computed once at
+    mount time and held in the worker's memory.
+
     The mount runs in the foreground until interrupted with Ctrl-C.
     """
     _setup_logging(verbose)
@@ -100,88 +107,41 @@ def mount_plink(
         raise click.ClickException(f"mount directory does not exist: {mount_dir}")
 
     log_path = pathlib.Path(access_log_path) if access_log_path is not None else None
+    resolved_basename = basename if basename is not None else _default_basename(vcz_url)
 
-    source = plink_source.PlinkSource(
-        vcz_url, basename=basename, backend_storage=backend_storage
+    trio.run(
+        _amount,
+        vcz_url,
+        str(mount_dir_path),
+        resolved_basename,
+        backend_storage,
+        log_path,
     )
-    backing_dir = source.open()
-    try:
-        click.echo(
-            f"materialised plink fileset for {vcz_url} ({source.basename})",
-            err=True,
-        )
+
+
+async def _amount(
+    vcz_url: str,
+    mount_dir: str,
+    basename: str,
+    backend_storage: str | None,
+    log_path: pathlib.Path | None,
+) -> None:
+    async with await bed_client.BedEncoderClient.connect(
+        vcz_url, backend_storage=backend_storage
+    ) as client:
         with access_log.AccessLogger(log_path) as access_logger:
-            view = passthrough_view.PassthroughDirectoryView(
-                backing_dir, access_logger=access_logger
-            )
-            try:
-                ops = fuse_adapter.BiofuseOperations(view)
-                with fuse_adapter.Mount(ops, str(mount_dir_path)):
-                    click.echo(f"mounted at {mount_dir_path}", err=True)
-                    _wait_for_signal()
-                    click.echo("unmounting", err=True)
-            finally:
-                view.close()
-    finally:
-        source.close()
+            ops = plink_ops.PlinkOps(client, basename, access_logger=access_logger)
+            async with fuse_adapter.mount(ops, mount_dir):
+                click.echo(f"mounted at {mount_dir}", err=True)
+                await _wait_for_signal()
+                click.echo("unmounting", err=True)
 
 
-@biofuse_main.command(name="mount-plink-streaming")
-@click.argument("vcz_url", type=str)
-@click.argument(
-    "mount_dir",
-    type=click.Path(file_okay=False, dir_okay=True, path_type=str),
-)
-@basename_opt
-@backend_storage
-@access_log_opt
-@verbose
-@handle_exception
-def mount_plink_streaming(
-    vcz_url, mount_dir, basename, backend_storage, access_log_path, verbose
-):
-    """Mount a streaming PLINK 1.9 view of VCZ_URL at MOUNT_DIR.
-
-    Unlike ``mount-plink``, this serves ``.bed`` on demand via
-    ``vcztools.BedEncoder`` (no upfront materialisation). The ``.bim`` and
-    ``.fam`` files are computed once at mount time and held in memory.
-
-    The mount runs in the foreground until interrupted with Ctrl-C.
-    """
-    _setup_logging(verbose)
-
-    mount_dir_path = pathlib.Path(mount_dir)
-    if not mount_dir_path.is_dir():
-        raise click.ClickException(f"mount directory does not exist: {mount_dir}")
-
-    log_path = pathlib.Path(access_log_path) if access_log_path is not None else None
-    resolved_basename = (
-        basename if basename is not None else plink_source.default_basename(vcz_url)
-    )
-
-    reader = vcztools_cli.make_reader(vcz_url, backend_storage=backend_storage)
-    with access_log.AccessLogger(log_path) as access_logger:
-        ops = plink_ops.PlinkOps(reader, resolved_basename, access_logger=access_logger)
-        with fuse_adapter.Mount(ops, str(mount_dir_path)):
-            click.echo(f"mounted at {mount_dir_path} (streaming)", err=True)
-            _wait_for_signal()
-            click.echo("unmounting", err=True)
-
-
-def _wait_for_signal() -> None:
-    """Block the calling thread until SIGINT or SIGTERM is received."""
-    stop = threading.Event()
-
-    def handler(signum, frame):
-        stop.set()
-
-    previous_int = signal.signal(signal.SIGINT, handler)
-    previous_term = signal.signal(signal.SIGTERM, handler)
-    try:
-        stop.wait()
-    finally:
-        signal.signal(signal.SIGINT, previous_int)
-        signal.signal(signal.SIGTERM, previous_term)
+async def _wait_for_signal() -> None:
+    """Return on first SIGINT or SIGTERM."""
+    with trio.open_signal_receiver(signal.SIGINT, signal.SIGTERM) as signals:
+        async for _ in signals:
+            return
 
 
 if __name__ == "__main__":

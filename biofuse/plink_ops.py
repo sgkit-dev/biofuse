@@ -1,23 +1,27 @@
 """Streaming pyfuse3.Operations for a PLINK 1.9 view of a VCZ store.
 
-Phase 2 strategy: rather than materialising the full ``.bed/.bim/.fam`` to
-disk and serving it through a passthrough view, this module wraps the
-``vcztools.BedEncoder`` directly. Each FUSE ``open()`` of ``.bed`` allocates
-a fresh encoder bound to a long-lived chunk iterator; ``.bim`` and ``.fam``
-are precomputed once and served from memory.
+Phase 2 strategy: rather than materialising the full ``.bed/.bim/.fam``
+to disk, the encoder work happens in a separate worker subprocess
+(see :mod:`biofuse.bed_worker` and :mod:`biofuse.bed_client`). This
+module is the pyfuse3 adapter that owns inode/handle bookkeeping,
+maps filenames to :class:`bed_protocol.FileType` tags, and delegates
+every read to the client.
 
 Design notes:
 
-- Per-handle ``BedEncoder`` keeps each consumer's iterator state isolated.
-  Multiple plink processes mounting the same path each get a distinct kernel
-  ``fh`` and therefore a distinct encoder; the underlying ``VczReader`` is
-  shared (``vcztools.plink.BedEncoder`` documents that as safe).
-- ``.bim`` and ``.fam`` are computed eagerly via ``generate_bim`` /
-  ``generate_fam`` at construction time so the first read does not block the
-  FUSE main loop on Zarr I/O.
-- The flat-directory bookkeeping (inode allocation, ``getattr``/``lookup``/
-  ``readdir``/``access``) mirrors ``BiofuseOperations`` — different per-handle
-  backend, same read-only top-level directory shape.
+- The FUSE process imports neither ``vcztools`` nor ``zarr``. All Zarr
+  metadata I/O and all ``BedEncoder`` state live in the worker.
+- PlinkOps owns all filename logic. Filenames never cross the wire to
+  the worker; the worker only sees opaque ``fh`` integers tagged with
+  a ``FileType``.
+- A FUSE handle (``fh``) maps 1:1 to a worker handle. PlinkOps
+  allocates the fh, asks the client to open it as a given
+  ``FileType``, releases it on FUSE release.
+- A :class:`trio.CapacityLimiter` caps concurrent open ``.bed`` files.
+  ``.bim`` and ``.fam`` are precomputed static bytes — cheap, never
+  blocked. Only ``BedEncoder`` keeps Zarr iterator state alive, so
+  the cap meaningfully bounds peak resource use under parallel
+  consumers without delaying trivial reads of the metadata files.
 """
 
 import errno
@@ -25,51 +29,34 @@ import logging
 import os
 import stat
 import threading
+from typing import Protocol
 
 import pyfuse3
-from vcztools import plink as vcztools_plink
-from vcztools import retrieval as vcztools_retrieval
+import trio
 
 from biofuse import access_log as access_log_mod
-from biofuse import view as view_mod
+from biofuse import bed_protocol
 
 logger = logging.getLogger(__name__)
 
 
-class _StaticBytesFile:
-    """Per-handle adapter for a file whose bytes are precomputed in memory.
+_DEFAULT_MAX_OPEN_BED = 16
+_FILE_MODE = stat.S_IFREG | 0o444
 
-    Implements the same ``read(off, size) -> bytes`` and ``close()`` shape as
-    ``vcztools.plink.BedEncoder`` so ``PlinkOps`` can dispatch uniformly.
+
+class BedEncoderClientProto(Protocol):
+    """The slice of :class:`biofuse.bed_client.BedEncoderClient` that
+    :class:`PlinkOps` depends on.
+
+    Defined as a Protocol so tests can inject a fake without spawning
+    a subprocess.
     """
 
-    def __init__(self, name: str, data: bytes) -> None:
-        self._name = name
-        self._data = data
-        self._closed = False
-
     @property
-    def name(self) -> str:
-        return self._name
-
-    @property
-    def size(self) -> int:
-        return len(self._data)
-
-    def read(self, off: int, size: int) -> bytes:
-        if self._closed:
-            raise RuntimeError("static file closed")
-        if off < 0:
-            raise ValueError(f"off must be >= 0 (got {off})")
-        if size < 0:
-            raise ValueError(f"size must be >= 0 (got {size})")
-        if off >= len(self._data) or size == 0:
-            return b""
-        end = min(off + size, len(self._data))
-        return bytes(self._data[off:end])
-
-    def close(self) -> None:
-        self._closed = True
+    def file_entries(self) -> dict[bed_protocol.FileType, int]: ...
+    async def open(self, fh: int, file_type: bed_protocol.FileType) -> None: ...
+    async def read(self, fh: int, offset: int, size: int) -> bytes: ...
+    async def release(self, fh: int) -> None: ...
 
 
 class PlinkOps(pyfuse3.Operations):
@@ -77,17 +64,19 @@ class PlinkOps(pyfuse3.Operations):
 
     Parameters
     ----------
-    reader
-        Already-constructed ``VczReader`` over the source store. The reader's
-        lifetime is owned by the caller; ``PlinkOps`` does not close it.
-        Must not have had ``set_variants()`` or any subset call applied
-        (``BedEncoder`` requires the default full-store variant axis).
+    client
+        A :class:`BedEncoderClient` (or any object satisfying
+        :class:`BedEncoderClientProto`) connected to a worker. The
+        caller owns the client's lifetime.
     basename
         Stem used for the three exposed files: ``{basename}.bed``,
         ``{basename}.bim``, ``{basename}.fam``.
+    max_open_bed
+        Maximum number of concurrent open ``.bed`` files. New ``.bed``
+        opens block until a peer release frees a slot. ``.bim``/``.fam``
+        opens are unaffected.
     access_logger
-        Optional ``AccessLogger`` to record per-FUSE-read traces. Useful for
-        comparing streaming-mode access patterns against phase-1 baselines.
+        Optional ``AccessLogger`` to record per-FUSE-read traces.
     """
 
     enable_writeback_cache = False
@@ -95,69 +84,46 @@ class PlinkOps(pyfuse3.Operations):
 
     def __init__(
         self,
-        reader: vcztools_retrieval.VczReader,
+        client: BedEncoderClientProto,
         basename: str,
         *,
+        max_open_bed: int = _DEFAULT_MAX_OPEN_BED,
         access_logger: access_log_mod.AccessLogger | None = None,
     ) -> None:
         super().__init__()
-        self._reader = reader
+        self._client = client
+        self._basename = basename
         self._access_logger = access_logger
         self._uid = os.getuid()
         self._gid = os.getgid()
         self._lock = threading.Lock()
+        self._bed_limiter = trio.CapacityLimiter(max_open_bed)
 
-        bim_text = vcztools_plink.generate_bim(reader)
-        fam_text = vcztools_plink.generate_fam(reader)
-        self._bim_bytes = bim_text.encode("utf-8")
-        self._fam_bytes = fam_text.encode("utf-8")
-
-        num_variants = reader.num_variants
-        num_samples = int(reader.sample_ids.size)
-        bytes_per_variant = (num_samples + 3) // 4
-        bed_size = 3 + num_variants * bytes_per_variant
-
+        sizes = client.file_entries
         bed_name = f"{basename}.bed"
         bim_name = f"{basename}.bim"
         fam_name = f"{basename}.fam"
-        entries = sorted(
+        files = sorted(
             [
-                view_mod.FileEntry(
-                    name=bed_name,
-                    size=bed_size,
-                    mtime_ns=0,
-                    mode=stat.S_IFREG | 0o444,
-                ),
-                view_mod.FileEntry(
-                    name=bim_name,
-                    size=len(self._bim_bytes),
-                    mtime_ns=0,
-                    mode=stat.S_IFREG | 0o444,
-                ),
-                view_mod.FileEntry(
-                    name=fam_name,
-                    size=len(self._fam_bytes),
-                    mtime_ns=0,
-                    mode=stat.S_IFREG | 0o444,
-                ),
-            ],
-            key=lambda e: e.name,
+                (bed_name, bed_protocol.FileType.BED, sizes[bed_protocol.FileType.BED]),
+                (bim_name, bed_protocol.FileType.BIM, sizes[bed_protocol.FileType.BIM]),
+                (fam_name, bed_protocol.FileType.FAM, sizes[bed_protocol.FileType.FAM]),
+            ]
         )
-        self._bed_name = bed_name
-        self._bim_name = bim_name
-        self._fam_name = fam_name
-
         self._inode_to_name: dict[int, str] = {}
         self._name_to_inode: dict[str, int] = {}
-        self._inode_to_entry: dict[int, view_mod.FileEntry] = {}
-        for index, entry in enumerate(entries):
+        self._inode_to_size: dict[int, int] = {}
+        self._name_to_type: dict[str, bed_protocol.FileType] = {}
+        for index, (name, file_type, size) in enumerate(files):
             inode = pyfuse3.ROOT_INODE + 1 + index
-            self._inode_to_name[inode] = entry.name
-            self._name_to_inode[entry.name] = inode
-            self._inode_to_entry[inode] = entry
+            self._inode_to_name[inode] = name
+            self._name_to_inode[name] = inode
+            self._inode_to_size[inode] = size
+            self._name_to_type[name] = file_type
 
         self._next_fh = 1
-        self._open_files: dict[int, _StaticBytesFile | vcztools_plink.BedEncoder] = {}
+        self._fh_to_type: dict[int, bed_protocol.FileType] = {}
+        self._fh_to_name: dict[int, str] = {}
 
     def _build_attrs(self, inode: int) -> pyfuse3.EntryAttributes:
         attrs = pyfuse3.EntryAttributes()
@@ -167,19 +133,16 @@ class PlinkOps(pyfuse3.Operations):
         if inode == pyfuse3.ROOT_INODE:
             attrs.st_mode = stat.S_IFDIR | 0o555
             attrs.st_size = 0
-            stamp = 0
         else:
-            entry = self._inode_to_entry[inode]
-            attrs.st_mode = entry.mode
-            attrs.st_size = entry.size
-            stamp = entry.mtime_ns
-        attrs.st_atime_ns = stamp
-        attrs.st_ctime_ns = stamp
-        attrs.st_mtime_ns = stamp
+            attrs.st_mode = _FILE_MODE
+            attrs.st_size = self._inode_to_size[inode]
+        attrs.st_atime_ns = 0
+        attrs.st_ctime_ns = 0
+        attrs.st_mtime_ns = 0
         return attrs
 
     async def getattr(self, inode, ctx=None):
-        if inode == pyfuse3.ROOT_INODE or inode in self._inode_to_entry:
+        if inode == pyfuse3.ROOT_INODE or inode in self._inode_to_size:
             return self._build_attrs(inode)
         raise pyfuse3.FUSEError(errno.ENOENT)
 
@@ -217,47 +180,61 @@ class PlinkOps(pyfuse3.Operations):
     async def open(self, inode, flags, ctx=None):
         if flags & (os.O_WRONLY | os.O_RDWR) or flags & os.O_APPEND:
             raise pyfuse3.FUSEError(errno.EROFS)
-        if inode not in self._inode_to_entry:
+        if inode not in self._inode_to_size:
             raise pyfuse3.FUSEError(errno.ENOENT)
         name = self._inode_to_name[inode]
-        if name == self._bed_name:
-            backend = vcztools_plink.BedEncoder(self._reader)
-        elif name == self._bim_name:
-            backend = _StaticBytesFile(name, self._bim_bytes)
-        elif name == self._fam_name:
-            backend = _StaticBytesFile(name, self._fam_bytes)
-        else:
-            raise pyfuse3.FUSEError(errno.ENOENT)
+        file_type = self._name_to_type[name]
         with self._lock:
             fh = self._next_fh
             self._next_fh += 1
-            self._open_files[fh] = backend
+        if file_type is bed_protocol.FileType.BED:
+            # Use the fh itself as the limiter borrower: each open is a
+            # distinct logical owner, even when several share the same
+            # trio task (true under direct PlinkOps tests, and cheap
+            # under pyfuse3 where each request is its own task).
+            await self._bed_limiter.acquire_on_behalf_of(fh)
+        try:
+            await self._client.open(fh, file_type)
+        except OSError as exc:
+            if file_type is bed_protocol.FileType.BED:
+                self._bed_limiter.release_on_behalf_of(fh)
+            raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
+        except BaseException:
+            if file_type is bed_protocol.FileType.BED:
+                self._bed_limiter.release_on_behalf_of(fh)
+            raise
+        # No more awaits below — sync dict updates, no checkpoint, so
+        # cancellation can't strand the limiter slot.
+        with self._lock:
+            self._fh_to_type[fh] = file_type
+            self._fh_to_name[fh] = name
         return pyfuse3.FileInfo(fh=fh)
 
     async def read(self, fh, off, size):
         with self._lock:
-            backend = self._open_files.get(fh)
-        if backend is None:
+            file_type = self._fh_to_type.get(fh)
+            name = self._fh_to_name.get(fh)
+        if file_type is None:
             raise pyfuse3.FUSEError(errno.EBADF)
         try:
-            data = backend.read(off, size)
+            data = await self._client.read(fh, off, size)
         except OSError as exc:
             raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
         if self._access_logger is not None:
-            name = (
-                backend.name
-                if isinstance(backend, _StaticBytesFile)
-                else self._bed_name
-            )
             self._access_logger.record(name, off, len(data))
         return data
 
     async def release(self, fh):
         with self._lock:
-            backend = self._open_files.pop(fh, None)
-        if backend is None:
+            file_type = self._fh_to_type.pop(fh, None)
+            self._fh_to_name.pop(fh, None)
+        if file_type is None:
             return
-        backend.close()
+        try:
+            await self._client.release(fh)
+        finally:
+            if file_type is bed_protocol.FileType.BED:
+                self._bed_limiter.release_on_behalf_of(fh)
 
     async def forget(self, inode_list):
         return
@@ -265,6 +242,21 @@ class PlinkOps(pyfuse3.Operations):
     async def access(self, inode, mode, ctx=None):
         if mode & os.W_OK:
             raise pyfuse3.FUSEError(errno.EROFS)
-        if inode == pyfuse3.ROOT_INODE or inode in self._inode_to_entry:
+        if inode == pyfuse3.ROOT_INODE or inode in self._inode_to_size:
             return
         raise pyfuse3.FUSEError(errno.ENOENT)
+
+    async def statfs(self, ctx=None):
+        block_size = 4096
+        total_bytes = sum(self._inode_to_size.values())
+        out = pyfuse3.StatvfsData()
+        out.f_bsize = block_size
+        out.f_frsize = block_size
+        out.f_blocks = (total_bytes + block_size - 1) // block_size
+        out.f_bfree = 0
+        out.f_bavail = 0
+        out.f_files = len(self._inode_to_size)
+        out.f_ffree = 0
+        out.f_favail = 0
+        out.f_namemax = 255
+        return out
