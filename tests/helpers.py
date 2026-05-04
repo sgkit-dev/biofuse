@@ -1,11 +1,11 @@
 """Test helpers shared across the biofuse test suite."""
 
-import io
 import pathlib
 from dataclasses import dataclass
 
-import bio2zarr.vcf as bio2zarr_vcf
+import bio2zarr.tskit as bio2zarr_tskit
 import msprime
+import numpy as np
 
 
 @dataclass(frozen=True)
@@ -17,6 +17,26 @@ class VczFixture:
     num_variants: int
     variants_chunk_size: int
     samples_chunk_size: int
+
+
+def _keep_first_mutation_per_site(ts):
+    """Drop second-and-later mutations at every site so the result is biallelic.
+
+    msprime can place multiple mutations at the same site (recurrent
+    mutation), which yields multi-allelic VCZ records that plink cannot
+    represent. Keep the first mutation per site (table rows are already
+    grouped by site) and rebuild the tree sequence.
+    """
+    tables = ts.dump_tables()
+    sites = tables.mutations.site
+    if len(sites) == 0:
+        return ts
+    keep = np.empty(len(sites), dtype=bool)
+    keep[0] = True
+    keep[1:] = sites[1:] != sites[:-1]
+    tables.mutations.keep_rows(keep)
+    tables.compute_mutation_parents()
+    return tables.tree_sequence()
 
 
 def simulate_vcz(
@@ -32,8 +52,9 @@ def simulate_vcz(
 ) -> VczFixture:
     """Simulate a tree sequence and convert it to VCZ on disk.
 
-    Returns a VczFixture pointing at a directory-format VCZ. The caller owns
-    cleanup of out_dir.
+    Returns a VczFixture pointing at a directory-format VCZ. The caller
+    owns cleanup of out_dir. The fixture is guaranteed biallelic: any
+    site with multiple mutations keeps only its first mutation.
     """
     ts = msprime.sim_ancestry(
         samples=num_diploid_samples,
@@ -45,19 +66,14 @@ def simulate_vcz(
         ts,
         rate=mutation_rate,
         random_seed=seed + 1,
-        model="binary",
     )
+    ts = _keep_first_mutation_per_site(ts)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    vcf_path = out_dir / f"{name}.vcf"
-    with vcf_path.open("w") as f:
-        ts.write_vcf(f)
-
     vcz_path = out_dir / f"{name}.vcz"
-    bio2zarr_vcf.convert(
-        [vcf_path],
+    bio2zarr_tskit.convert(
+        ts,
         vcz_path,
-        worker_processes=0,
         variants_chunk_size=variants_chunk_size,
         samples_chunk_size=samples_chunk_size,
     )
@@ -71,48 +87,3 @@ def simulate_vcz(
         variants_chunk_size=variants_chunk_size,
         samples_chunk_size=samples_chunk_size,
     )
-
-
-def vcf_to_vcz(
-    vcf_path: pathlib.Path,
-    vcz_path: pathlib.Path,
-    *,
-    variants_chunk_size: int | None = None,
-    samples_chunk_size: int | None = None,
-) -> pathlib.Path:
-    """Thin wrapper around bio2zarr.vcf.convert returning the output path."""
-    bio2zarr_vcf.convert(
-        [vcf_path],
-        vcz_path,
-        worker_processes=0,
-        variants_chunk_size=variants_chunk_size,
-        samples_chunk_size=samples_chunk_size,
-    )
-    return vcz_path
-
-
-def write_vcf_for_tree_sequence(
-    ts,
-    path: pathlib.Path,
-) -> pathlib.Path:
-    """Write a tree sequence to a VCF file at path."""
-    with path.open("w") as f:
-        ts.write_vcf(f)
-    return path
-
-
-def read_bytes(path: pathlib.Path) -> bytes:
-    """Convenience: read all bytes from a path."""
-    return path.read_bytes()
-
-
-def read_text(path: pathlib.Path) -> str:
-    """Convenience: read all text from a path."""
-    return path.read_text()
-
-
-def vcf_to_string(ts) -> str:
-    """Render a tree sequence to a VCF string (for ad-hoc inspection)."""
-    buf = io.StringIO()
-    ts.write_vcf(buf)
-    return buf.getvalue()

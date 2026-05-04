@@ -43,7 +43,7 @@ test = [
   "pytest-cov",
   "pytest-trio",
   "pytest-xdist",
-  "bio2zarr[vcf]",
+  "bio2zarr[tskit]",
   "msprime",
 ]
 
