@@ -89,6 +89,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Needed to install pyfuse3, which builds from source.
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev pkg-config
+
       - name: Install uv and set the python version
         uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
         with:
