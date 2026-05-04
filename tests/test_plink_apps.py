@@ -24,6 +24,7 @@ from vcztools.plink import write_plink
 
 from biofuse import (
     access_log,
+    bed_client,
     fuse_adapter,
     passthrough_view,
     plink_ops,
@@ -72,8 +73,9 @@ def fx_mounted_plink(request, tmp_path, fx_medium_vcz):
         cleanups.append(view.close)
         cleanups.append(source.close)
     else:
-        reader = make_reader(str(fx_medium_vcz.path))
-        ops = plink_ops.PlinkOps(reader, "medium", access_logger=log)
+        client = bed_client.BedEncoderClient(str(fx_medium_vcz.path), "medium")
+        ops = plink_ops.PlinkOps(client, access_logger=log)
+        cleanups.append(client.close)
 
     mount = fuse_adapter.Mount(ops, str(mnt))
     mount.__enter__()

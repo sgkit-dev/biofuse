@@ -8,10 +8,10 @@ import threading
 from functools import wraps
 
 import click
-from vcztools import cli as vcztools_cli
 
 from biofuse import (
     access_log,
+    bed_client,
     fuse_adapter,
     passthrough_view,
     plink_ops,
@@ -159,13 +159,18 @@ def mount_plink_streaming(
         basename if basename is not None else plink_source.default_basename(vcz_url)
     )
 
-    reader = vcztools_cli.make_reader(vcz_url, backend_storage=backend_storage)
-    with access_log.AccessLogger(log_path) as access_logger:
-        ops = plink_ops.PlinkOps(reader, resolved_basename, access_logger=access_logger)
-        with fuse_adapter.Mount(ops, str(mount_dir_path)):
-            click.echo(f"mounted at {mount_dir_path} (streaming)", err=True)
-            _wait_for_signal()
-            click.echo("unmounting", err=True)
+    client = bed_client.BedEncoderClient(
+        vcz_url, resolved_basename, backend_storage=backend_storage
+    )
+    try:
+        with access_log.AccessLogger(log_path) as access_logger:
+            ops = plink_ops.PlinkOps(client, access_logger=access_logger)
+            with fuse_adapter.Mount(ops, str(mount_dir_path)):
+                click.echo(f"mounted at {mount_dir_path} (streaming)", err=True)
+                _wait_for_signal()
+                click.echo("unmounting", err=True)
+    finally:
+        client.close()
 
 
 def _wait_for_signal() -> None:
