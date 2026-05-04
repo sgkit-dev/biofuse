@@ -79,6 +79,11 @@ dev = [
     { name = "validate-pyproject", extra = ["all"] },
     { name = "zizmor" },
 ]
+fs-tests = [
+    { name = "bio2zarr", extra = ["tskit"] },
+    { name = "click" },
+    { name = "msprime" },
+]
 lint = [
     { name = "prek" },
     { name = "ruff" },
@@ -118,6 +123,11 @@ dev = [
     { name = "twine" },
     { name = "validate-pyproject", extras = ["all"] },
     { name = "zizmor", specifier = "==1.24.1" },
+]
+fs-tests = [
+    { name = "bio2zarr", extras = ["tskit"] },
+    { name = "click", specifier = ">=8.2.0" },
+    { name = "msprime" },
 ]
 lint = [
     { name = "prek", specifier = "==0.3.3" },

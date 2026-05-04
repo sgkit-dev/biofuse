@@ -58,6 +58,14 @@ packaging = [
   "validate-pyproject[all]",
 ]
 
+# Used by fs_tests/ harness for POSIX compliance and read-stress runs.
+# Not required for normal biofuse use; invoke via fs_tests/run.sh.
+fs-tests = [
+  "click>=8.2.0",
+  "bio2zarr[tskit]",
+  "msprime",
+]
+
 dev = [
   {include-group = "test"},
   {include-group = "lint"},

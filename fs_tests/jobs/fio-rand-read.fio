@@ -1,0 +1,17 @@
+[global]
+ioengine=psync
+direct=0
+rw=randread
+verify=0
+group_reporting=1
+time_based=1
+runtime=30s
+filename=${TARGET_FILE}
+
+[rand-4k]
+bs=4k
+stonewall
+
+[rand-64k]
+bs=64k
+stonewall
