@@ -38,7 +38,7 @@ class PlinkSource:
     ) -> None:
         self._vcz_path = vcz_path
         self._basename = (
-            basename if basename is not None else _default_basename(vcz_path)
+            basename if basename is not None else default_basename(vcz_path)
         )
         self._backend_storage = backend_storage
         self._storage_options = storage_options
@@ -85,7 +85,7 @@ class PlinkSource:
         self.close()
 
 
-def _default_basename(vcz_path: str | pathlib.Path) -> str:
+def default_basename(vcz_path: str | pathlib.Path) -> str:
     p = pathlib.Path(vcz_path)
     name = p.name
     while True:

@@ -53,9 +53,7 @@ def _random_10(bed: open_bed) -> dict:
     n_var = bed.sid_count
     var_idx = sorted({rng.randrange(n_var) for _ in range(10)})
     sample_idx = sorted({rng.randrange(n_iid) for _ in range(10)})
-    arr = bed.read(
-        index=np.s_[np.array(sample_idx), np.array(var_idx)], dtype="int8"
-    )
+    arr = bed.read(index=np.s_[np.array(sample_idx), np.array(var_idx)], dtype="int8")
     return {
         "shape": list(arr.shape),
         "var_idx": var_idx,

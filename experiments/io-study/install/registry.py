@@ -86,8 +86,6 @@ REGISTRY: tuple[ToolSpec, ...] = (
         # bolt is dynamically linked against Intel's libiomp5; the
         # tarball ships its own copy under lib/. The harness sets
         # LD_LIBRARY_PATH to ``_tools/bolt/lib`` for ops that invoke it.
-        extra_members=(
-            ("*/lib/libiomp5.so", "lib/libiomp5.so"),
-        ),
+        extra_members=(("*/lib/libiomp5.so", "lib/libiomp5.so"),),
     ),
 )

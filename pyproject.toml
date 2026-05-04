@@ -14,7 +14,7 @@ dependencies = [
   "click>=8.2.0",
   "pyfuse3>=3.4.0",
   "trio>=0.22",
-  "vcztools",
+  "vcztools@git+https://github.com/sgkit-dev/vcztools.git@main",
 ]
 requires-python = ">=3.11"
 classifiers = [
@@ -37,9 +37,6 @@ repository = "https://github.com/sgkit-dev/biofuse"
 [project.scripts]
 biofuse = "biofuse.cli:biofuse_main"
 
-[tool.uv.sources]
-vcztools = { path = "../vcztools", editable = true }
-
 [dependency-groups]
 test = [
   "pytest",
@@ -51,6 +48,8 @@ test = [
 
 lint = [
   "ruff==0.15.1",
+  "prek==0.3.3",
+  "zizmor==1.24.1",
 ]
 
 packaging = [

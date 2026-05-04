@@ -66,7 +66,8 @@ fusermount3 -u /tmp/plink-mnt
 uv sync --group dev
 uv run pytest             # full suite
 uv run pytest tests/test_passthrough_view.py  # one module
-uv run ruff check .
+uv run prek install       # install git pre-commit hook (one-off)
+uv run --only-group=lint prek -c prek.toml run --all-files
 ```
 
 ## Roadmap

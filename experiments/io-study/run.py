@@ -217,7 +217,7 @@ def _render(arg: str, substitutions: dict[str, str]) -> str:
     mapping = {}
     for k, v in substitutions.items():
         if k.startswith("aux:"):
-            mapping[f"aux_{k[len('aux:'):]}"] = v
+            mapping[f"aux_{k[len('aux:') :]}"] = v
         else:
             mapping[k] = v
     return template.substitute(mapping)

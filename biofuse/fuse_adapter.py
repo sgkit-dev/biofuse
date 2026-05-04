@@ -163,10 +163,14 @@ class BiofuseOperations(pyfuse3.Operations):
 
 
 class Mount:
-    """Context manager that mounts a FilesystemView via pyfuse3.
+    """Context manager that mounts a pyfuse3.Operations via pyfuse3.
 
     Mounts on ``__enter__``, runs the FUSE main loop on a background thread,
     and unmounts cleanly on ``__exit__``.
+
+    The caller owns the lifecycle of the operations object: ``Mount`` does not
+    construct or close it. This decouples the mount-loop machinery from the
+    choice of Operations implementation (BiofuseOperations, PlinkOps, ...).
 
     pyfuse3's mount state is process-global, so only one Mount may be live
     in a given Python process at a time.
@@ -177,21 +181,18 @@ class Mount:
 
     def __init__(
         self,
-        view: view_mod.FilesystemView,
+        operations: pyfuse3.Operations,
         mountpoint: str,
         *,
         fsname: str = "biofuse",
         debug_fuse: bool = False,
-        direct_io: bool = False,
     ) -> None:
-        self._view = view
+        self._operations = operations
         self._mountpoint = mountpoint
         self._fsname = fsname
         self._debug_fuse = debug_fuse
-        self._direct_io = direct_io
         self._thread: threading.Thread | None = None
         self._exception: BaseException | None = None
-        self._ops: BiofuseOperations | None = None
         self._closed = False
 
     def __enter__(self) -> str:
@@ -201,13 +202,12 @@ class Mount:
                 "pyfuse3 supports only one mount at a time"
             )
         try:
-            self._ops = BiofuseOperations(self._view, direct_io=self._direct_io)
             options = set(pyfuse3.default_options)
             options.add(f"fsname={self._fsname}")
             options.add("ro")
             if self._debug_fuse:
                 options.add("debug")
-            pyfuse3.init(self._ops, self._mountpoint, options)
+            pyfuse3.init(self._operations, self._mountpoint, options)
         except BaseException:
             Mount._global_lock.release()
             raise
