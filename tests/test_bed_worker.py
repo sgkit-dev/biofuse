@@ -410,9 +410,7 @@ class TestWorkerMainSmoke:
 
     def test_spawn_and_list(self, fx_small_vcz):
         ctx = mp.get_context("spawn")
-        parent_sock, child_sock = socket.socketpair(
-            socket.AF_UNIX, socket.SOCK_STREAM
-        )
+        parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         proc = ctx.Process(
             target=bed_worker._worker_main,
             args=(child_sock, str(fx_small_vcz.path), None),

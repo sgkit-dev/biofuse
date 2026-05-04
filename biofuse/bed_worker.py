@@ -99,9 +99,7 @@ class WorkerSession:
         bytes_per_variant = (num_samples + 3) // 4
         self._bed_size = 3 + num_variants * bytes_per_variant
 
-        self._open_handles: dict[
-            int, vcztools_plink.BedEncoder | _StaticBytesFile
-        ] = {}
+        self._open_handles: dict[int, vcztools_plink.BedEncoder | _StaticBytesFile] = {}
 
     def list_files(self) -> list[tuple[bed_protocol.FileType, int]]:
         return [
@@ -241,9 +239,7 @@ def serve(sock: socket.socket, session: WorkerSession) -> None:
         session.close()
 
 
-def _dispatch(
-    session: WorkerSession, tag: bytes, args: tuple[object, ...]
-) -> bytes:
+def _dispatch(session: WorkerSession, tag: bytes, args: tuple[object, ...]) -> bytes:
     if tag == bed_protocol.TAG_LIST:
         entries = session.list_files()
         return bed_protocol.pack_list_reply(entries)

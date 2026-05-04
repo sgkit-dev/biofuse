@@ -245,3 +245,18 @@ class PlinkOps(pyfuse3.Operations):
         if inode == pyfuse3.ROOT_INODE or inode in self._inode_to_size:
             return
         raise pyfuse3.FUSEError(errno.ENOENT)
+
+    async def statfs(self, ctx=None):
+        block_size = 4096
+        total_bytes = sum(self._inode_to_size.values())
+        out = pyfuse3.StatvfsData()
+        out.f_bsize = block_size
+        out.f_frsize = block_size
+        out.f_blocks = (total_bytes + block_size - 1) // block_size
+        out.f_bfree = 0
+        out.f_bavail = 0
+        out.f_files = len(self._inode_to_size)
+        out.f_ffree = 0
+        out.f_favail = 0
+        out.f_namemax = 255
+        return out

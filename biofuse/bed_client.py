@@ -56,9 +56,7 @@ class BedEncoderClient:
         # the FUSE mount is live, so no concurrent trio task needs the
         # loop. Wrap proc.start() in trio.to_thread.run_sync only if
         # we ever start spawning workers from inside a busy loop.
-        parent_sock, child_sock = socket.socketpair(
-            socket.AF_UNIX, socket.SOCK_STREAM
-        )
+        parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             proc: mp.process.BaseProcess = ctx.Process(
                 target=bed_worker._worker_main,
@@ -125,9 +123,7 @@ class BedEncoderClient:
         request = bed_protocol.pack_read_request(fh, offset, size)
         async with self._lock:
             await self._stream.send_all(request)
-            status_buf = await _recv_exact(
-                self._stream, bed_protocol.REPLY_STATUS_SIZE
-            )
+            status_buf = await _recv_exact(self._stream, bed_protocol.REPLY_STATUS_SIZE)
             status = bed_protocol.parse_status(status_buf)
             if status < 0:
                 raise bed_protocol.status_to_error(status)
@@ -162,14 +158,10 @@ class BedEncoderClient:
 
     # -- internals -------------------------------------------------------
 
-    async def _roundtrip(
-        self, request: bytes, *, body_size: int
-    ) -> tuple[int, bytes]:
+    async def _roundtrip(self, request: bytes, *, body_size: int) -> tuple[int, bytes]:
         async with self._lock:
             await self._stream.send_all(request)
-            status_buf = await _recv_exact(
-                self._stream, bed_protocol.REPLY_STATUS_SIZE
-            )
+            status_buf = await _recv_exact(self._stream, bed_protocol.REPLY_STATUS_SIZE)
             status = bed_protocol.parse_status(status_buf)
             if status < 0:
                 return status, b""
@@ -180,17 +172,13 @@ class BedEncoderClient:
 
     async def _handshake_list(self) -> dict[bed_protocol.FileType, int]:
         await self._stream.send_all(bed_protocol.pack_list_request())
-        status_buf = await _recv_exact(
-            self._stream, bed_protocol.REPLY_STATUS_SIZE
-        )
+        status_buf = await _recv_exact(self._stream, bed_protocol.REPLY_STATUS_SIZE)
         status = bed_protocol.parse_status(status_buf)
         if status < 0:
             raise bed_protocol.status_to_error(status)
         entries: dict[bed_protocol.FileType, int] = {}
         for _ in range(status):
-            entry = await _recv_exact(
-                self._stream, bed_protocol.REPLY_LIST_ENTRY_SIZE
-            )
+            entry = await _recv_exact(self._stream, bed_protocol.REPLY_LIST_ENTRY_SIZE)
             file_type, size = bed_protocol.parse_list_entry(entry)
             entries[file_type] = size
         return entries

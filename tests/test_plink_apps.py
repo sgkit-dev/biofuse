@@ -197,6 +197,26 @@ class TestParallelClient:
         assert errors == []
 
 
+class TestStatfs:
+    """End-to-end check that ``statvfs(2)`` against the mount returns
+    sensible values rather than ENOSYS.
+    """
+
+    async def test_statfs_via_os_statvfs(self, fx_mounted_plink):
+        mnt, _, _, _ = fx_mounted_plink
+        # os.statvfs syscalls into the FUSE mount; if we ran it on the
+        # trio thread that's also serving FUSE requests we'd deadlock,
+        # so route it through a worker thread.
+        info = await trio.to_thread.run_sync(os.statvfs, str(mnt))
+        assert info.f_bsize > 0
+        assert info.f_blocks > 0
+        # Read-only, fixed-size FS: nothing free.
+        assert info.f_bavail == 0
+        assert info.f_ffree == 0
+        assert info.f_files == 3
+        assert info.f_namemax >= 255
+
+
 @needs_plink1
 class TestAccessTrace:
     """Captures access patterns for inspection in phase-2 design."""

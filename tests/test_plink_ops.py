@@ -103,8 +103,7 @@ class TestConstructor:
 
     def test_sizes_match_client_entries(self, fx_ops):
         sizes = {
-            fx_ops._inode_to_name[i]: size
-            for i, size in fx_ops._inode_to_size.items()
+            fx_ops._inode_to_name[i]: size for i, size in fx_ops._inode_to_size.items()
         }
         assert sizes == {"small.bed": 1024, "small.bim": 256, "small.fam": 100}
 
@@ -324,6 +323,35 @@ class TestOpendir:
 class TestForget:
     async def test_forget_is_noop(self, fx_ops):
         await fx_ops.forget([(2, 1), (3, 1)])
+
+
+class TestStatfs:
+    async def test_returns_statvfs_data_with_expected_fields(self, fx_ops):
+        out = await fx_ops.statfs()
+        assert isinstance(out, pyfuse3.StatvfsData)
+
+    async def test_block_count_matches_sum_of_file_sizes(self, fx_ops):
+        out = await fx_ops.statfs()
+        total = 1024 + 256 + 100  # bed + bim + fam from _default_sizes
+        assert out.f_bsize > 0
+        assert out.f_frsize == out.f_bsize
+        assert out.f_blocks == (total + out.f_bsize - 1) // out.f_bsize
+
+    async def test_no_free_space(self, fx_ops):
+        out = await fx_ops.statfs()
+        assert out.f_bfree == 0
+        assert out.f_bavail == 0
+        assert out.f_ffree == 0
+        assert out.f_favail == 0
+
+    async def test_reports_three_files(self, fx_ops):
+        out = await fx_ops.statfs()
+        assert out.f_files == 3
+
+    async def test_namemax_is_at_least_posix_min(self, fx_ops):
+        out = await fx_ops.statfs()
+        # POSIX _POSIX_NAME_MAX is 14; any sane FS reports much more.
+        assert out.f_namemax >= 255
 
 
 class TestCapacityLimiter:
