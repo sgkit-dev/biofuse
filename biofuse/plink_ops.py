@@ -32,6 +32,12 @@ logger = logging.getLogger(__name__)
 _FILE_MODE = stat.S_IFREG | 0o444
 _DEFAULT_MAX_OPEN_BED = 16
 
+# Maximum time a FUSE_OPEN may wait at the per-mount ``.bed`` capacity
+# limiter. On expiry the open returns ``EAGAIN`` to the kernel rather
+# than blocking forever — this guards against a leaked limiter slot
+# permanently wedging open().
+_LIMITER_TIMEOUT_S = 30.0
+
 
 class _BedConnectionProto(Protocol):
     async def read(self, off: int, size: int) -> bytes: ...
@@ -185,7 +191,10 @@ class PlinkOps(pyfuse3.Operations):
             # distinct logical owner, even when several share the same
             # trio task (true under direct PlinkOps tests, and cheap
             # under pyfuse3 where each request is its own task).
-            await self._bed_limiter.acquire_on_behalf_of(fh)
+            with trio.move_on_after(_LIMITER_TIMEOUT_S) as cs:
+                await self._bed_limiter.acquire_on_behalf_of(fh)
+            if cs.cancelled_caught:
+                raise pyfuse3.FUSEError(errno.EAGAIN)
             try:
                 conn = await self._client.open_bed()
             except OSError as exc:

@@ -426,6 +426,23 @@ class TestCapacityLimiter:
         info = await ops.open(bed_inode, os.O_RDONLY)
         await ops.release(info.fh)
 
+    async def test_open_returns_eagain_when_limiter_starved(
+        self, fx_client, monkeypatch
+    ):
+        """A leaked limiter slot must not pin FUSE_OPEN forever.
+
+        With the cap held by an existing open and the slot never
+        released, a competing open must surface ``EAGAIN`` once the
+        per-mount limiter deadline expires."""
+        monkeypatch.setattr(plink_ops, "_LIMITER_TIMEOUT_S", 0.2)
+        ops = plink_ops.PlinkOps(fx_client, "small", max_open_bed=1)
+        bed_inode = ops._name_to_inode["small.bed"]
+        held = await ops.open(bed_inode, os.O_RDONLY)
+        try:
+            await _expect_fuse_error(ops.open(bed_inode, os.O_RDONLY), errno.EAGAIN)
+        finally:
+            await ops.release(held.fh)
+
 
 class TestReadOnly:
     async def test_access_write_denied(self, fx_ops):
