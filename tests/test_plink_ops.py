@@ -13,6 +13,8 @@ import stat
 
 import pyfuse3
 import pytest
+import trio
+import trio.testing
 
 from biofuse import access_log, plink_ops
 
@@ -378,6 +380,51 @@ class TestAccessLogger:
         assert bed_records[0].size == 100
         assert bim_records[0].offset == 0
         assert bim_records[0].size == 50
+
+
+class TestCapacityLimiter:
+    """The .bed-only capacity limiter throttles concurrent .bed opens
+    without blocking .bim/.fam.
+    """
+
+    async def test_bed_blocks_at_cap(self, fx_client):
+        ops = plink_ops.PlinkOps(fx_client, "small", max_open_bed=2)
+        bed_inode = ops._name_to_inode["small.bed"]
+        info1 = await ops.open(bed_inode, os.O_RDONLY)
+        info2 = await ops.open(bed_inode, os.O_RDONLY)
+
+        third_info: list[pyfuse3.FileInfo] = []
+
+        async def third_open():
+            info = await ops.open(bed_inode, os.O_RDONLY)
+            third_info.append(info)
+
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(third_open)
+            await trio.testing.wait_all_tasks_blocked()
+            assert third_info == []  # blocked at limiter
+            await ops.release(info1.fh)
+
+        assert len(third_info) == 1
+        await ops.release(info2.fh)
+        await ops.release(third_info[0].fh)
+
+    async def test_bim_does_not_block_when_bed_at_cap(self, fx_client):
+        ops = plink_ops.PlinkOps(fx_client, "small", max_open_bed=1)
+        bed_inode = ops._name_to_inode["small.bed"]
+        bim_inode = ops._name_to_inode["small.bim"]
+        bed_info = await ops.open(bed_inode, os.O_RDONLY)
+        bim_info = await ops.open(bim_inode, os.O_RDONLY)
+        await ops.release(bim_info.fh)
+        await ops.release(bed_info.fh)
+
+    async def test_failed_open_releases_slot(self, fx_client):
+        ops = plink_ops.PlinkOps(fx_client, "small", max_open_bed=1)
+        bed_inode = ops._name_to_inode["small.bed"]
+        fx_client.raise_on_next_open(OSError(errno.EACCES, "denied"))
+        await _expect_fuse_error(ops.open(bed_inode, os.O_RDONLY), errno.EACCES)
+        info = await ops.open(bed_inode, os.O_RDONLY)
+        await ops.release(info.fh)
 
 
 class TestReadOnly:

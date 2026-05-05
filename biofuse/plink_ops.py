@@ -23,6 +23,7 @@ import time
 from typing import Protocol
 
 import pyfuse3
+import trio
 
 from biofuse import access_log as access_log_mod
 
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 _FILE_MODE = stat.S_IFREG | 0o444
+_DEFAULT_MAX_OPEN_BED = 16
 
 
 class _BedConnectionProto(Protocol):
@@ -64,6 +66,11 @@ class PlinkOps(pyfuse3.Operations):
     basename
         Stem used for the three exposed files: ``{basename}.bed``,
         ``{basename}.bim``, ``{basename}.fam``.
+    max_open_bed
+        Maximum number of concurrent open ``.bed`` files. New ``.bed``
+        opens block until a peer release frees a slot. ``.bim``/``.fam``
+        opens are unaffected — they're served from cached static bytes
+        and carry no per-fh state worth queueing.
     access_logger
         Optional ``AccessLogger`` to record per-FUSE-read traces.
     """
@@ -76,6 +83,7 @@ class PlinkOps(pyfuse3.Operations):
         client: PlinkClientProto,
         basename: str,
         *,
+        max_open_bed: int = _DEFAULT_MAX_OPEN_BED,
         access_logger: access_log_mod.AccessLogger | None = None,
     ) -> None:
         super().__init__()
@@ -85,6 +93,7 @@ class PlinkOps(pyfuse3.Operations):
         self._uid = os.getuid()
         self._gid = os.getgid()
         self._lock = threading.Lock()
+        self._bed_limiter = trio.CapacityLimiter(max_open_bed)
 
         bed_name = f"{basename}.bed"
         bim_name = f"{basename}.bim"
@@ -175,10 +184,19 @@ class PlinkOps(pyfuse3.Operations):
             fh = self._next_fh
             self._next_fh += 1
         if kind == "bed":
+            # Use the fh itself as the limiter borrower: each open is a
+            # distinct logical owner, even when several share the same
+            # trio task (true under direct PlinkOps tests, and cheap
+            # under pyfuse3 where each request is its own task).
+            await self._bed_limiter.acquire_on_behalf_of(fh)
             try:
                 conn = await self._client.open_bed()
             except OSError as exc:
+                self._bed_limiter.release_on_behalf_of(fh)
                 raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
+            except BaseException:
+                self._bed_limiter.release_on_behalf_of(fh)
+                raise
             with self._lock:
                 self._fh_to_kind[fh] = kind
                 self._fh_to_name[fh] = name
@@ -222,15 +240,20 @@ class PlinkOps(pyfuse3.Operations):
 
     async def release(self, fh):
         with self._lock:
-            self._fh_to_kind.pop(fh, None)
+            kind = self._fh_to_kind.pop(fh, None)
             self._fh_to_name.pop(fh, None)
             conn = self._fh_to_conn.pop(fh, None)
-        if conn is None:
+        if kind is None:
             return
         try:
-            await conn.aclose()
-        except Exception as exc:  # noqa: BLE001 - best-effort cleanup
-            logger.debug("bed connection close raised: %s", exc)
+            if conn is not None:
+                try:
+                    await conn.aclose()
+                except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+                    logger.debug("bed connection close raised: %s", exc)
+        finally:
+            if kind == "bed":
+                self._bed_limiter.release_on_behalf_of(fh)
 
     async def forget(self, inode_list):
         return
