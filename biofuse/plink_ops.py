@@ -18,7 +18,6 @@ import errno
 import logging
 import os
 import stat
-import threading
 import time
 from typing import Protocol
 
@@ -92,7 +91,6 @@ class PlinkOps(pyfuse3.Operations):
         self._access_logger = access_logger
         self._uid = os.getuid()
         self._gid = os.getgid()
-        self._lock = threading.Lock()
         self._bed_limiter = trio.CapacityLimiter(max_open_bed)
 
         bed_name = f"{basename}.bed"
@@ -180,9 +178,8 @@ class PlinkOps(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.ENOENT)
         name = self._inode_to_name[inode]
         kind = self._name_to_kind[name]
-        with self._lock:
-            fh = self._next_fh
-            self._next_fh += 1
+        fh = self._next_fh
+        self._next_fh += 1
         if kind == "bed":
             # Use the fh itself as the limiter borrower: each open is a
             # distinct logical owner, even when several share the same
@@ -197,21 +194,15 @@ class PlinkOps(pyfuse3.Operations):
             except BaseException:
                 self._bed_limiter.release_on_behalf_of(fh)
                 raise
-            with self._lock:
-                self._fh_to_kind[fh] = kind
-                self._fh_to_name[fh] = name
-                self._fh_to_conn[fh] = conn
-        else:
-            with self._lock:
-                self._fh_to_kind[fh] = kind
-                self._fh_to_name[fh] = name
+            self._fh_to_conn[fh] = conn
+        self._fh_to_kind[fh] = kind
+        self._fh_to_name[fh] = name
         return pyfuse3.FileInfo(fh=fh)
 
     async def read(self, fh, off, size):
-        with self._lock:
-            kind = self._fh_to_kind.get(fh)
-            name = self._fh_to_name.get(fh)
-            conn = self._fh_to_conn.get(fh)
+        kind = self._fh_to_kind.get(fh)
+        name = self._fh_to_name.get(fh)
+        conn = self._fh_to_conn.get(fh)
         if kind is None:
             raise pyfuse3.FUSEError(errno.EBADF)
         t_start = time.monotonic()
@@ -239,10 +230,9 @@ class PlinkOps(pyfuse3.Operations):
         return bytes(data[off:end])
 
     async def release(self, fh):
-        with self._lock:
-            kind = self._fh_to_kind.pop(fh, None)
-            self._fh_to_name.pop(fh, None)
-            conn = self._fh_to_conn.pop(fh, None)
+        kind = self._fh_to_kind.pop(fh, None)
+        self._fh_to_name.pop(fh, None)
+        conn = self._fh_to_conn.pop(fh, None)
         if kind is None:
             return
         try:
