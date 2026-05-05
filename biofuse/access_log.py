@@ -1,10 +1,15 @@
 """Access pattern logging.
 
 Records each ``read`` operation observed by the filesystem view as an
-``(path, offset, size, monotonic_time)`` row. The in-memory mode keeps rows
-in a list for tests and aggregation; the JSONL mode appends a single line
-per row to a file for offline analysis (e.g. characterising what a real
-PLINK invocation actually reads).
+``(path, fh, offset, size, t_start, t_end)`` row. Both timestamps are
+captured so post-hoc analysis can detect overlapping reads — when two
+records share a ``[t_start, t_end]`` window but carry distinct ``fh``,
+the underlying RPC pipeline was actually concurrent.
+
+The in-memory mode keeps rows in a list for tests and aggregation; the
+JSONL mode appends a single line per row to a file for offline
+analysis (e.g. characterising what a real PLINK invocation actually
+reads).
 """
 
 import json
@@ -20,9 +25,11 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class AccessRecord:
     path: str
+    fh: int
     offset: int
     size: int
-    t_monotonic: float
+    t_start: float
+    t_end: float
 
 
 class AccessLogger:
@@ -51,9 +58,28 @@ class AccessLogger:
         with self._lock:
             return list(self._records)
 
-    def record(self, path: str, offset: int, size: int) -> None:
+    def record(
+        self,
+        path: str,
+        fh: int,
+        offset: int,
+        size: int,
+        t_start: float,
+    ) -> None:
+        """Record one read.
+
+        ``t_start`` is the monotonic timestamp the caller captured before
+        issuing the read; ``t_end`` is captured inside this call. The
+        difference is the read's wall-clock duration; overlap between
+        records with distinct ``fh`` indicates concurrent execution.
+        """
         rec = AccessRecord(
-            path=path, offset=offset, size=size, t_monotonic=time.monotonic()
+            path=path,
+            fh=fh,
+            offset=offset,
+            size=size,
+            t_start=t_start,
+            t_end=time.monotonic(),
         )
         with self._lock:
             if self._fh is not None:

@@ -29,6 +29,7 @@ import logging
 import os
 import stat
 import threading
+import time
 from typing import Protocol
 
 import pyfuse3
@@ -216,12 +217,13 @@ class PlinkOps(pyfuse3.Operations):
             name = self._fh_to_name.get(fh)
         if file_type is None:
             raise pyfuse3.FUSEError(errno.EBADF)
+        t_start = time.monotonic()
         try:
             data = await self._client.read(fh, off, size)
         except OSError as exc:
             raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
         if self._access_logger is not None:
-            self._access_logger.record(name, off, len(data))
+            self._access_logger.record(name, fh, off, len(data), t_start)
         return data
 
     async def release(self, fh):

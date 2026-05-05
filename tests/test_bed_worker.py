@@ -6,8 +6,8 @@ smoke test that exercises the real spawn handshake):
 - ``_StaticBytesFile`` — the in-memory backend for ``.bim``/``.fam``.
 - ``WorkerSession`` — the in-process logic that owns ``VczReader``
   and the open-handle table. Most of the parity tests live here.
-- ``serve()`` — the blocking request/reply loop, exercised against
-  an in-process ``socket.socketpair`` running on a thread.
+- ``serve()`` — the multi-threaded request/reply loop, exercised
+  against an in-process ``socket.socketpair`` running on a thread.
 """
 
 import errno
@@ -219,6 +219,40 @@ class TestWorkerSessionConcurrentHandles:
             fx_session.release(1)
             fx_session.release(2)
 
+    def test_threaded_reads_on_distinct_fhs(self, fx_session, fx_golden_dir):
+        """Reads on distinct fhs from concurrent threads each get correct
+        bytes."""
+        golden, basename = fx_golden_dir
+        expected = (golden / f"{basename}.bed").read_bytes()
+        n_threads = 4
+        for fh in range(1, n_threads + 1):
+            fx_session.open(fh, BED)
+        results: dict[int, bytes] = {}
+        errors: list[BaseException] = []
+
+        def worker(fh):
+            try:
+                # Each thread streams the whole file end-to-end on its own fh.
+                got = fx_session.read(fh, 0, len(expected) * 2)
+                results[fh] = got
+            except BaseException as exc:  # noqa: BLE001 - propagate to assert
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=worker, args=(fh,))
+            for fh in range(1, n_threads + 1)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        try:
+            assert errors == []
+            assert all(results[fh] == expected for fh in range(1, n_threads + 1))
+        finally:
+            for fh in range(1, n_threads + 1):
+                fx_session.release(fh)
+
 
 class TestWorkerSessionRelease:
     def test_reopen_after_release(self, fx_session, fx_golden_dir):
@@ -265,11 +299,14 @@ class TestWorkerSessionClose:
 
 
 def _spawn_serve_thread(
-    session: bed_worker.WorkerSession,
+    session: bed_worker.WorkerSession, *, max_workers: int = 4
 ) -> tuple[socket.socket, threading.Thread]:
     parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     thread = threading.Thread(
-        target=bed_worker.serve, args=(child_sock, session), daemon=True
+        target=bed_worker.serve,
+        args=(child_sock, session),
+        kwargs={"max_workers": max_workers},
+        daemon=True,
     )
     thread.start()
     return parent_sock, thread
@@ -285,19 +322,31 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 
+def _recv_reply(sock: socket.socket) -> tuple[int, int, bytes]:
+    """Read one reply frame; returns (seq, status, body)."""
+    header = _recv_exact(sock, bed_protocol.REPLY_HEADER_SIZE)
+    seq, status = bed_protocol.parse_reply_header(header)
+    body = b""
+    if status > 0:
+        body = _recv_exact(sock, status)
+    return seq, status, body
+
+
 class TestServe:
     def test_list_request(self, fx_session):
         parent, thread = _spawn_serve_thread(fx_session)
         try:
-            parent.sendall(bed_protocol.pack_list_request())
-            status = bed_protocol.parse_status(
-                _recv_exact(parent, bed_protocol.REPLY_STATUS_SIZE)
-            )
-            assert status == 3
+            parent.sendall(bed_protocol.pack_list_request(1))
+            seq, status, body = _recv_reply(parent)
+            assert seq == 1
+            assert status == 3 * bed_protocol.REPLY_LIST_ENTRY_SIZE
             entries = []
-            for _ in range(status):
-                entry = _recv_exact(parent, bed_protocol.REPLY_LIST_ENTRY_SIZE)
-                entries.append(bed_protocol.parse_list_entry(entry))
+            for offset in range(0, len(body), bed_protocol.REPLY_LIST_ENTRY_SIZE):
+                entries.append(
+                    bed_protocol.parse_list_entry(
+                        body[offset : offset + bed_protocol.REPLY_LIST_ENTRY_SIZE]
+                    )
+                )
             assert [t for t, _ in entries] == [BED, BIM, FAM]
         finally:
             parent.close()
@@ -309,28 +358,19 @@ class TestServe:
         expected = (golden / f"{basename}.bed").read_bytes()
         parent, thread = _spawn_serve_thread(fx_session)
         try:
-            parent.sendall(bed_protocol.pack_open_request(42, BED))
-            assert (
-                bed_protocol.parse_status(
-                    _recv_exact(parent, bed_protocol.REPLY_STATUS_SIZE)
-                )
-                == 0
-            )
+            parent.sendall(bed_protocol.pack_open_request(10, 42, BED))
+            seq, status, _ = _recv_reply(parent)
+            assert (seq, status) == (10, 0)
 
-            parent.sendall(bed_protocol.pack_read_request(42, 0, len(expected)))
-            n = bed_protocol.parse_status(
-                _recv_exact(parent, bed_protocol.REPLY_STATUS_SIZE)
-            )
-            assert n == len(expected)
-            assert _recv_exact(parent, n) == expected
+            parent.sendall(bed_protocol.pack_read_request(11, 42, 0, len(expected)))
+            seq, status, body = _recv_reply(parent)
+            assert seq == 11
+            assert status == len(expected)
+            assert body == expected
 
-            parent.sendall(bed_protocol.pack_close_request(42))
-            assert (
-                bed_protocol.parse_status(
-                    _recv_exact(parent, bed_protocol.REPLY_STATUS_SIZE)
-                )
-                == 0
-            )
+            parent.sendall(bed_protocol.pack_close_request(12, 42))
+            seq, status, _ = _recv_reply(parent)
+            assert (seq, status) == (12, 0)
         finally:
             parent.close()
             thread.join(timeout=5)
@@ -339,20 +379,13 @@ class TestServe:
     def test_open_duplicate_fh_returns_eexist(self, fx_session):
         parent, thread = _spawn_serve_thread(fx_session)
         try:
-            parent.sendall(bed_protocol.pack_open_request(1, BED))
-            assert (
-                bed_protocol.parse_status(
-                    _recv_exact(parent, bed_protocol.REPLY_STATUS_SIZE)
-                )
-                == 0
-            )
-            parent.sendall(bed_protocol.pack_open_request(1, BED))
-            assert (
-                bed_protocol.parse_status(
-                    _recv_exact(parent, bed_protocol.REPLY_STATUS_SIZE)
-                )
-                == -errno.EEXIST
-            )
+            parent.sendall(bed_protocol.pack_open_request(1, 1, BED))
+            seq, status, _ = _recv_reply(parent)
+            assert (seq, status) == (1, 0)
+            parent.sendall(bed_protocol.pack_open_request(2, 1, BED))
+            seq, status, _ = _recv_reply(parent)
+            assert seq == 2
+            assert status == -errno.EEXIST
         finally:
             parent.close()
             thread.join(timeout=5)
@@ -360,10 +393,9 @@ class TestServe:
     def test_read_unknown_handle_returns_ebadf(self, fx_session):
         parent, thread = _spawn_serve_thread(fx_session)
         try:
-            parent.sendall(bed_protocol.pack_read_request(9999, 0, 10))
-            status = bed_protocol.parse_status(
-                _recv_exact(parent, bed_protocol.REPLY_STATUS_SIZE)
-            )
+            parent.sendall(bed_protocol.pack_read_request(7, 9999, 0, 10))
+            seq, status, _ = _recv_reply(parent)
+            assert seq == 7
             assert status == -errno.EBADF
         finally:
             parent.close()
@@ -372,7 +404,8 @@ class TestServe:
     def test_unknown_tag_terminates_loop(self, fx_session):
         parent, thread = _spawn_serve_thread(fx_session)
         try:
-            parent.sendall(b"Z")
+            # Valid 9-byte header but with an unknown tag byte.
+            parent.sendall(struct.pack("<Q", 0) + b"Z")
             thread.join(timeout=5)
             assert not thread.is_alive()
         finally:
@@ -387,7 +420,9 @@ class TestServe:
     def test_partial_request_terminates_loop(self, fx_session):
         parent, thread = _spawn_serve_thread(fx_session)
         try:
-            parent.sendall(b"R" + struct.pack("<Q", 1))  # truncated READ
+            # Truncated READ payload: full 9-byte header + only 8 bytes
+            # of the 24-byte READ payload.
+            parent.sendall(struct.pack("<Q", 0) + b"R" + struct.pack("<Q", 1))
             parent.close()
             thread.join(timeout=5)
             assert not thread.is_alive()
@@ -396,6 +431,46 @@ class TestServe:
                 parent.close()
             except OSError:
                 pass
+
+    def test_concurrent_reads_complete(self, fx_session, fx_golden_dir):
+        """Pipelined reads on distinct fhs all return correctly even when
+        sent back-to-back without waiting for individual replies."""
+        golden, basename = fx_golden_dir
+        expected = (golden / f"{basename}.bed").read_bytes()
+        parent, thread = _spawn_serve_thread(fx_session, max_workers=4)
+        try:
+            n = 4
+            # Open 4 fhs (sequentially is fine; opens are cheap).
+            for i in range(n):
+                parent.sendall(bed_protocol.pack_open_request(100 + i, i + 1, BED))
+                seq, status, _ = _recv_reply(parent)
+                assert (seq, status) == (100 + i, 0)
+
+            # Pipeline 4 full-file READs without awaiting between them.
+            for i in range(n):
+                parent.sendall(
+                    bed_protocol.pack_read_request(200 + i, i + 1, 0, len(expected))
+                )
+
+            # Drain replies; they may arrive in any order.
+            got: dict[int, bytes] = {}
+            for _ in range(n):
+                seq, status, body = _recv_reply(parent)
+                assert 200 <= seq < 200 + n
+                assert status == len(expected)
+                got[seq] = body
+            assert all(b == expected for b in got.values())
+
+            for i in range(n):
+                parent.sendall(bed_protocol.pack_close_request(300 + i, i + 1))
+            for _ in range(n):
+                seq, status, _ = _recv_reply(parent)
+                assert 300 <= seq < 300 + n
+                assert status == 0
+        finally:
+            parent.close()
+            thread.join(timeout=10)
+            assert not thread.is_alive()
 
 
 # -- subprocess smoke test -------------------------------------------------
@@ -418,13 +493,12 @@ class TestWorkerMainSmoke:
         proc.start()
         child_sock.close()
         try:
-            parent_sock.sendall(bed_protocol.pack_list_request())
-            status = bed_protocol.parse_status(
-                _recv_exact(parent_sock, bed_protocol.REPLY_STATUS_SIZE)
-            )
-            assert status == 3
-            for _ in range(status):
-                _recv_exact(parent_sock, bed_protocol.REPLY_LIST_ENTRY_SIZE)
+            parent_sock.sendall(bed_protocol.pack_list_request(7))
+            header = _recv_exact(parent_sock, bed_protocol.REPLY_HEADER_SIZE)
+            seq, status = bed_protocol.parse_reply_header(header)
+            assert seq == 7
+            assert status == 3 * bed_protocol.REPLY_LIST_ENTRY_SIZE
+            _recv_exact(parent_sock, status)
         finally:
             parent_sock.close()
             proc.join(timeout=10)
