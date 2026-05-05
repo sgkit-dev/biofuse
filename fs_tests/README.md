@@ -11,7 +11,7 @@ every PR.
 | POSIX syscall semantics | native Python | ~10 s |
 | pjdfstest curated subset | external (`pjdfstest`) | ~30–60 s |
 | Read-pattern stress | external (`fio`) | ~3 min |
-| Read cross-validation | external (`fsx_readonly`) | ~30 s |
+| Read cross-validation | native Python (fsx-style) | ~30 s |
 | Filesystem stressor | external (`stress-ng`) | ~2 min |
 | Mount/unmount cycling | native Python | ~2 min |
 | **Total** | | **~10–15 min** |
@@ -39,17 +39,16 @@ uv sync --group fs-tests
 `pjdfstest` is fetched and built on first run into
 `fs_tests/third_party/pjdfstest/` (gitignored).
 
-`fsx_readonly` is built on first run from
-`fs_tests/tools/fsx_readonly.c` into `fs_tests/.cache/fsx_readonly`.
-
 ## Running
 
+Run from the repository root:
+
 ```bash
-./fs_tests/run.sh                  # all categories
-./fs_tests/run.sh --quick          # smoke run (skips pjdfstest + large fio)
-./fs_tests/run.sh posix            # one category
-./fs_tests/run.sh fio --large      # fio with the 500 MB fixture
-./fs_tests/run.sh --results /tmp/biofuse-results all
+uv run --group fs-tests python -m fs_tests.harness                  # all categories
+uv run --group fs-tests python -m fs_tests.harness --quick          # smoke run (skips pjdfstest + large fio)
+uv run --group fs-tests python -m fs_tests.harness posix            # one category
+uv run --group fs-tests python -m fs_tests.harness fio --large      # fio with the 500 MB fixture
+uv run --group fs-tests python -m fs_tests.harness --results /tmp/biofuse-results all
 ```
 
 Output lands in `fs_tests/results/<UTC-timestamp>/`:
@@ -95,12 +94,10 @@ host (page cache, CPU, fixture size).
 **fsx is read-only mode only.** Apple/LTP/xfstests fsx all assume a
 writable filesystem (they bootstrap the in-memory model by writing to
 the file under test). None of them run unmodified against a read-only
-mount. Rather than vendor and heavily patch one, the harness ships
-`fs_tests/tools/fsx_readonly.c` — a small standalone C tool that
-implements the *core* of fsx for read-only mode: random pread + mmap
-read with cross-validation against an oracle copy of the file kept on
-the host filesystem. Output format is fsx-compatible
-(`All N operations completed A-OK!`, `MISMATCH at offset=...`).
+mount. Rather than vendor and heavily patch one, the harness
+reimplements the read-only core in `harness/fsx_runner.py`: random
+pread + mmap read with cross-validation against an oracle copy of the
+file kept on the host filesystem.
 
 ## Adding a new check
 

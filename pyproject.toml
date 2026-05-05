@@ -59,7 +59,8 @@ packaging = [
 ]
 
 # Used by fs_tests/ harness for POSIX compliance and read-stress runs.
-# Not required for normal biofuse use; invoke via fs_tests/run.sh.
+# Not required for normal biofuse use; invoke via
+# `uv run --group fs-tests python -m fs_tests.harness`.
 fs-tests = [
   "click>=8.2.0",
   "bio2zarr[tskit]",

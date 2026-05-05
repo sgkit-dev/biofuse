@@ -8,7 +8,7 @@ import sys
 
 import click
 
-from harness import (
+from . import (
     fio_runner,
     fsx_runner,
     lifecycle,

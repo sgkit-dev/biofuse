@@ -26,8 +26,8 @@ import tempfile
 import time
 from collections.abc import Callable
 
-from harness import fixtures, tools
-from harness import mount as mount_mod
+from . import fixtures, tools
+from . import mount as mount_mod
 
 logger = logging.getLogger(__name__)
 

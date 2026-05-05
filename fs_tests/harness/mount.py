@@ -78,7 +78,8 @@ class BiofuseMount:
         if biofuse_bin is None:
             raise RuntimeError(
                 "biofuse executable not found on PATH; "
-                "run the harness via fs_tests/run.sh which uses uv run"
+                "run the harness via "
+                "`uv run --group fs-tests python -m fs_tests.harness`"
             )
         cmd: list[str] = [
             biofuse_bin,

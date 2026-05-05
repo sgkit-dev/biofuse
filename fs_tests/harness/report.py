@@ -9,7 +9,7 @@ import platform
 import socket
 import sys
 
-from harness import tools
+from . import tools
 
 logger = logging.getLogger(__name__)
 
