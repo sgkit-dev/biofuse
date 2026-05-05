@@ -184,14 +184,6 @@ def serve_forever(
             pass
 
 
-# Per-encoder readahead worker cap. ``vcztools`` defaults to
-# ``min(32, cpu_count())`` workers in each encoder's
-# ``ReadaheadPipeline``; with N concurrent ``.bed`` connections that
-# multiplies into hundreds of threads in this single subprocess and can
-# exhaust the per-process thread limit. We cap conservatively.
-_PER_ENCODER_READAHEAD_WORKERS = 2
-
-
 def _server_main(
     listener_sock: socket.socket,
     stop_sock: socket.socket,
@@ -201,15 +193,17 @@ def _server_main(
     """Subprocess entry point invoked via ``multiprocessing.Process``.
 
     The two sockets are handle-passed by ``multiprocessing`` (the
-    reduction machinery dups the fds into the child).
+    reduction machinery dups the fds into the child). The reader is
+    used as a context manager so its shared ``ThreadPoolExecutor``
+    (one pool per reader, drawn on by every ``BedEncoder`` /
+    ``ReadaheadPipeline``) is drained on the way out.
     """
-    reader = vcztools_cli.make_reader(vcz_url, backend_storage=backend_storage)
-    reader.readahead_workers = _PER_ENCODER_READAHEAD_WORKERS
-    session = _ServerSession(reader)
-    try:
-        serve_forever(listener_sock, stop_sock, session)
-    finally:
+    with vcztools_cli.make_reader(vcz_url, backend_storage=backend_storage) as reader:
+        session = _ServerSession(reader)
         try:
-            stop_sock.close()
-        except OSError:
-            pass
+            serve_forever(listener_sock, stop_sock, session)
+        finally:
+            try:
+                stop_sock.close()
+            except OSError:
+                pass
