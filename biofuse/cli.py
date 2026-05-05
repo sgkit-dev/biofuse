@@ -2,7 +2,6 @@
 
 import logging
 import pathlib
-import shutil
 import signal
 import sys
 import tempfile
@@ -112,9 +111,8 @@ def mount_plink(
     log_path = pathlib.Path(access_log_path) if access_log_path is not None else None
     resolved_basename = basename if basename is not None else _default_basename(vcz_url)
 
-    sock_dir = pathlib.Path(tempfile.mkdtemp(prefix="biofuse-"))
-    sock_path = sock_dir / "plink.sock"
-    try:
+    with tempfile.TemporaryDirectory(prefix="biofuse-") as sock_dir:
+        sock_path = pathlib.Path(sock_dir) / "plink.sock"
         trio.run(
             _amount,
             vcz_url,
@@ -124,8 +122,6 @@ def mount_plink(
             log_path,
             sock_path,
         )
-    finally:
-        shutil.rmtree(sock_dir, ignore_errors=True)
 
 
 async def _amount(
