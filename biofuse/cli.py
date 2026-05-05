@@ -4,12 +4,13 @@ import logging
 import pathlib
 import signal
 import sys
+import tempfile
 from functools import wraps
 
 import click
 import trio
 
-from biofuse import access_log, bed_client, fuse_adapter, plink_ops
+from biofuse import access_log, fuse_adapter, plink_client, plink_ops
 
 logger = logging.getLogger(__name__)
 
@@ -94,9 +95,10 @@ def mount_plink(
 ):
     """Mount a PLINK 1.9 view of VCZ_URL at MOUNT_DIR.
 
-    Serves ``.bed`` on demand via a worker subprocess running
-    ``vcztools.BedEncoder``; ``.bim`` and ``.fam`` are computed once at
-    mount time and held in the worker's memory.
+    Spawns a plink-server subprocess that owns the ``VczReader`` and
+    serves ``.bed`` reads over an ``AF_UNIX`` socket. ``.bim`` and
+    ``.fam`` are precomputed once at mount time and held in the FUSE
+    process's memory; only ``.bed`` reads cross the wire.
 
     The mount runs in the foreground until interrupted with Ctrl-C.
     """
@@ -109,14 +111,17 @@ def mount_plink(
     log_path = pathlib.Path(access_log_path) if access_log_path is not None else None
     resolved_basename = basename if basename is not None else _default_basename(vcz_url)
 
-    trio.run(
-        _amount,
-        vcz_url,
-        str(mount_dir_path),
-        resolved_basename,
-        backend_storage,
-        log_path,
-    )
+    with tempfile.TemporaryDirectory(prefix="biofuse-") as sock_dir:
+        sock_path = pathlib.Path(sock_dir) / "plink.sock"
+        trio.run(
+            _amount,
+            vcz_url,
+            str(mount_dir_path),
+            resolved_basename,
+            backend_storage,
+            log_path,
+            sock_path,
+        )
 
 
 async def _amount(
@@ -125,9 +130,10 @@ async def _amount(
     basename: str,
     backend_storage: str | None,
     log_path: pathlib.Path | None,
+    sock_path: pathlib.Path,
 ) -> None:
-    async with await bed_client.BedEncoderClient.connect(
-        vcz_url, backend_storage=backend_storage
+    async with await plink_client.PlinkClient.start(
+        vcz_url, sock_path, backend_storage=backend_storage
     ) as client:
         with access_log.AccessLogger(log_path) as access_logger:
             ops = plink_ops.PlinkOps(client, basename, access_logger=access_logger)

@@ -61,6 +61,7 @@ class BiofuseMount:
         *,
         basename: str | None = None,
         log_path: pathlib.Path | None = None,
+        access_log_path: pathlib.Path | None = None,
         startup_timeout_s: float = 30.0,
         shutdown_timeout_s: float = 15.0,
     ) -> None:
@@ -68,6 +69,7 @@ class BiofuseMount:
         self.mountpoint = mountpoint
         self.basename = basename
         self.log_path = log_path
+        self.access_log_path = access_log_path
         self.startup_timeout_s = startup_timeout_s
         self.shutdown_timeout_s = shutdown_timeout_s
         self._proc: subprocess.Popen[bytes] | None = None
@@ -89,6 +91,8 @@ class BiofuseMount:
         ]
         if self.basename is not None:
             cmd += ["--basename", self.basename]
+        if self.access_log_path is not None:
+            cmd += ["--access-log", str(self.access_log_path)]
         return cmd
 
     def __enter__(self) -> pathlib.Path:
