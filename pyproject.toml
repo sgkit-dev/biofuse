@@ -43,7 +43,7 @@ test = [
   "pytest-cov",
   "pytest-trio",
   "pytest-xdist",
-  "bio2zarr[vcf]",
+  "bio2zarr[tskit]",
   "msprime",
 ]
 
@@ -56,6 +56,15 @@ lint = [
 packaging = [
   "twine",
   "validate-pyproject[all]",
+]
+
+# Used by fs_tests/ harness for POSIX compliance and read-stress runs.
+# Not required for normal biofuse use; invoke via
+# `uv run --group fs-tests python -m fs_tests.harness`.
+fs-tests = [
+  "click>=8.2.0",
+  "bio2zarr[tskit]",
+  "msprime",
 ]
 
 dev = [

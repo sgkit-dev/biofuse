@@ -1,0 +1,11 @@
+[global]
+ioengine=mmap
+rw=read
+verify=0
+group_reporting=1
+time_based=1
+runtime=30s
+
+[mmap-seq]
+filename=${TARGET_FILE}
+bs=64k
