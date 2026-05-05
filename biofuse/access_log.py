@@ -30,6 +30,7 @@ class AccessRecord:
     size: int
     t_start: float
     t_end: float
+    kind: str = "read"
 
 
 class AccessLogger:
@@ -73,14 +74,43 @@ class AccessLogger:
         difference is the read's wall-clock duration; overlap between
         records with distinct ``fh`` indicates concurrent execution.
         """
-        rec = AccessRecord(
-            path=path,
-            fh=fh,
-            offset=offset,
-            size=size,
-            t_start=t_start,
-            t_end=time.monotonic(),
+        self._write(
+            AccessRecord(
+                path=path,
+                fh=fh,
+                offset=offset,
+                size=size,
+                t_start=t_start,
+                t_end=time.monotonic(),
+            )
         )
+
+    def record_event(
+        self,
+        kind: str,
+        path: str,
+        fh: int,
+        t_start: float,
+        t_end: float | None = None,
+    ) -> None:
+        """Record a non-read lifecycle event (open / release / limiter_wait /
+        aclose). ``offset`` and ``size`` are zero for these events; the
+        ``[t_start, t_end]`` interval is what matters."""
+        if t_end is None:
+            t_end = time.monotonic()
+        self._write(
+            AccessRecord(
+                path=path,
+                fh=fh,
+                offset=0,
+                size=0,
+                t_start=t_start,
+                t_end=t_end,
+                kind=kind,
+            )
+        )
+
+    def _write(self, rec: AccessRecord) -> None:
         with self._lock:
             if self._fh is not None:
                 self._fh.write(json.dumps(asdict(rec)) + "\n")

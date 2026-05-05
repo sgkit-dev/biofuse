@@ -13,6 +13,8 @@ import logging
 import multiprocessing as mp
 import pathlib
 import socket
+import time
+from collections.abc import Callable
 
 import trio
 
@@ -45,10 +47,16 @@ class BedConnection:
     threads and do not contend with each other.
     """
 
-    def __init__(self, stream: trio.SocketStream) -> None:
+    def __init__(
+        self,
+        stream: trio.SocketStream,
+        *,
+        on_aclose: Callable[[float, float], None] | None = None,
+    ) -> None:
         self._stream = stream
         self._lock = trio.Lock()
         self._closed = False
+        self._on_aclose = on_aclose
 
     async def read(self, off: int, size: int) -> bytes:
         if self._closed:
@@ -87,6 +95,7 @@ class BedConnection:
         if self._closed:
             return
         self._closed = True
+        t_start = time.monotonic()
         with trio.CancelScope(shield=True):
             with trio.move_on_after(_ACLOSE_TIMEOUT_S) as cs:
                 try:
@@ -103,6 +112,11 @@ class BedConnection:
                     "bed connection aclose timed out after %.1fs",
                     _ACLOSE_TIMEOUT_S,
                 )
+        if self._on_aclose is not None:
+            try:
+                self._on_aclose(t_start, time.monotonic())
+            except Exception as exc:  # noqa: BLE001 - never let logging blow up cleanup
+                logger.debug("on_aclose hook raised: %s", exc)
 
 
 class PlinkClient:
@@ -177,10 +191,14 @@ class PlinkClient:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.aclose()
 
-    async def open_bed(self) -> BedConnection:
+    async def open_bed(
+        self,
+        *,
+        on_aclose: Callable[[float, float], None] | None = None,
+    ) -> BedConnection:
         """Open a new dedicated socket for one ``.bed`` reader."""
         stream = await self._connect_stream()
-        return BedConnection(stream)
+        return BedConnection(stream, on_aclose=on_aclose)
 
     async def aclose(self) -> None:
         """Tear down the server. Idempotent.

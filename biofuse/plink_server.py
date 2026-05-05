@@ -16,6 +16,7 @@ import logging
 import select
 import socket
 import threading
+import time
 
 from vcztools import cli as vcztools_cli
 from vcztools import plink as vcztools_plink
@@ -72,6 +73,8 @@ def _handle_connection(conn_sock: socket.socket, session: _ServerSession) -> Non
     The connection's ``BedEncoder`` is allocated lazily on the first
     ``READ`` so the metadata-handshake socket pays no encoder cost.
     """
+    tname = threading.current_thread().name
+    logger.debug("%s: conn accepted", tname)
     encoder: vcztools_plink.BedEncoder | None = None
     try:
         while True:
@@ -96,8 +99,22 @@ def _handle_connection(conn_sock: socket.socket, session: _ServerSession) -> Non
                         return
                     off, size = plink_protocol.parse_read_payload(payload)
                     if encoder is None:
+                        t_enc = time.monotonic()
                         encoder = vcztools_plink.BedEncoder(session.reader)
+                        logger.debug(
+                            "%s: encoder created in %.3fs",
+                            tname,
+                            time.monotonic() - t_enc,
+                        )
+                    t_read = time.monotonic()
                     data = encoder.read(off, size)
+                    logger.debug(
+                        "%s: encoder.read off=%d size=%d in %.3fs",
+                        tname,
+                        off,
+                        size,
+                        time.monotonic() - t_read,
+                    )
                     reply = plink_protocol.pack_read_reply(data)
                 else:
                     logger.warning(
@@ -116,14 +133,22 @@ def _handle_connection(conn_sock: socket.socket, session: _ServerSession) -> Non
                 return
     finally:
         if encoder is not None:
+            t_close = time.monotonic()
+            logger.debug("%s: eof; encoder.close ...", tname)
             try:
                 encoder.close()
             except Exception as exc:  # noqa: BLE001 - best-effort cleanup
                 logger.debug("encoder close raised: %s", exc)
+            logger.debug(
+                "%s: encoder.close done in %.3fs",
+                tname,
+                time.monotonic() - t_close,
+            )
         try:
             conn_sock.close()
         except OSError:
             pass
+        logger.debug("%s: conn thread exit", tname)
 
 
 def serve_forever(

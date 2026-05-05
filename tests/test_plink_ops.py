@@ -10,6 +10,7 @@ FUSE behaviour against real plink binaries is in ``test_plink_apps.py``.
 import errno
 import os
 import stat
+import time
 
 import pyfuse3
 import pytest
@@ -28,11 +29,17 @@ class _FakeBedConnection:
     ``(offset, size)``.
     """
 
-    def __init__(self, conn_id: int, calls: list[tuple]) -> None:
+    def __init__(
+        self,
+        conn_id: int,
+        calls: list[tuple],
+        on_aclose=None,
+    ) -> None:
         self.conn_id = conn_id
         self._calls = calls
         self._closed = False
         self._next_error: OSError | None = None
+        self._on_aclose = on_aclose
 
     def raise_on_next_read(self, exc: OSError) -> None:
         self._next_error = exc
@@ -48,8 +55,11 @@ class _FakeBedConnection:
         return bytes(((offset + i) & 0xFF) for i in range(size))
 
     async def aclose(self) -> None:
+        t0 = time.monotonic()
         self._calls.append(("aclose", self.conn_id))
         self._closed = True
+        if self._on_aclose is not None:
+            self._on_aclose(t0, time.monotonic())
 
 
 class _FakeClient:
@@ -76,13 +86,13 @@ class _FakeClient:
     def raise_on_next_open(self, exc: OSError) -> None:
         self._next_open_error = exc
 
-    async def open_bed(self) -> _FakeBedConnection:
+    async def open_bed(self, *, on_aclose=None) -> _FakeBedConnection:
         self.calls.append(("open_bed",))
         if self._next_open_error is not None:
             exc = self._next_open_error
             self._next_open_error = None
             raise exc
-        conn = _FakeBedConnection(self._next_conn_id, self.calls)
+        conn = _FakeBedConnection(self._next_conn_id, self.calls, on_aclose=on_aclose)
         self._next_conn_id += 1
         self.connections.append(conn)
         return conn
@@ -371,7 +381,7 @@ class TestAccessLogger:
         finally:
             await ops.release(bed_info.fh)
             await ops.release(bim_info.fh)
-        records = log.records
+        records = [r for r in log.records if r.kind == "read"]
         bed_records = [r for r in records if r.path.endswith(".bed")]
         bim_records = [r for r in records if r.path.endswith(".bim")]
         assert len(bed_records) == 1
@@ -442,6 +452,40 @@ class TestCapacityLimiter:
             await _expect_fuse_error(ops.open(bed_inode, os.O_RDONLY), errno.EAGAIN)
         finally:
             await ops.release(held.fh)
+
+
+class TestLifecycleEvents:
+    """``open`` / ``release`` / ``aclose`` / ``limiter_wait`` events
+    are emitted on the access logger so we can localise where time is
+    spent in the lifecycle without changing the read trace."""
+
+    async def test_bed_emits_full_lifecycle(self, fx_client):
+        log = access_log.AccessLogger()
+        ops = plink_ops.PlinkOps(fx_client, "small", access_logger=log)
+        bed_inode = ops._name_to_inode["small.bed"]
+        info = await ops.open(bed_inode, os.O_RDONLY)
+        await ops.read(info.fh, 0, 8)
+        await ops.release(info.fh)
+        kinds = [r.kind for r in log.records]
+        assert "limiter_wait" in kinds
+        assert "open" in kinds
+        assert "read" in kinds
+        assert "release" in kinds
+        assert "aclose" in kinds
+        # `release` and `aclose` should both be tied to the same fh.
+        rel = next(r for r in log.records if r.kind == "release")
+        acl = next(r for r in log.records if r.kind == "aclose")
+        assert rel.fh == info.fh
+        assert acl.fh == info.fh
+
+    async def test_static_emits_open_and_release_only(self, fx_client):
+        log = access_log.AccessLogger()
+        ops = plink_ops.PlinkOps(fx_client, "small", access_logger=log)
+        bim_inode = ops._name_to_inode["small.bim"]
+        info = await ops.open(bim_inode, os.O_RDONLY)
+        await ops.release(info.fh)
+        kinds = [r.kind for r in log.records]
+        assert kinds == ["open", "release"]
 
 
 class TestReadOnly:
