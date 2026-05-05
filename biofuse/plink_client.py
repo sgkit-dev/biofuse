@@ -146,6 +146,7 @@ class PlinkClient:
         socket_path: pathlib.Path,
         *,
         backend_storage: str | None = None,
+        log_level: int | None = None,
     ) -> "PlinkClient":
         """Spawn the server, run the metadata handshake, return client.
 
@@ -153,6 +154,11 @@ class PlinkClient:
         itself, then hands both to the child. Multiprocessing's socket
         reduction dups the fds across the spawn boundary; the parent
         closes its own copies once the child has started.
+
+        ``log_level`` is forwarded to the subprocess so its
+        ``logger.debug`` / ``info`` output appears in the parent's
+        log sink. If ``None``, the subprocess uses its default
+        (WARNING).
         """
         socket_path = pathlib.Path(socket_path)
         socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -163,9 +169,11 @@ class PlinkClient:
         listener.listen(64)
         parent_stop, child_stop = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         ctx = mp.get_context("spawn")
+        if log_level is None:
+            log_level = logging.getLogger().getEffectiveLevel()
         proc: mp.process.BaseProcess = ctx.Process(
             target=plink_server._server_main,
-            args=(listener, child_stop, vcz_url, backend_storage),
+            args=(listener, child_stop, vcz_url, backend_storage, log_level),
             name="biofuse-plink-server",
         )
         try:

@@ -214,6 +214,7 @@ def _server_main(
     stop_sock: socket.socket,
     vcz_url: str,
     backend_storage: str | None,
+    log_level: int = logging.WARNING,
 ) -> None:
     """Subprocess entry point invoked via ``multiprocessing.Process``.
 
@@ -222,7 +223,16 @@ def _server_main(
     used as a context manager so its shared ``ThreadPoolExecutor``
     (one pool per reader, drawn on by every ``BedEncoder`` /
     ``ReadaheadPipeline``) is drained on the way out.
+
+    ``log_level`` matches the parent's verbosity so the subprocess's
+    own ``logger.debug`` / ``logger.info`` output reaches the same
+    sink as the parent.
     """
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
     with vcztools_cli.make_reader(vcz_url, backend_storage=backend_storage) as reader:
         session = _ServerSession(reader)
         try:
