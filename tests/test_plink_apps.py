@@ -25,7 +25,7 @@ import trio
 from vcztools.cli import make_reader
 from vcztools.plink import write_plink
 
-from biofuse import access_log, bed_client, fuse_adapter, plink_ops
+from biofuse import access_log, fuse_adapter, plink_client, plink_ops
 
 PLINK1 = shutil.which("plink1.9") or shutil.which("plink")
 PLINK2 = shutil.which("plink2")
@@ -67,8 +67,9 @@ async def fx_mounted_plink(tmp_path, fx_medium_vcz):
     write_plink(make_reader(str(fx_medium_vcz.path)), golden / "medium")
 
     log = access_log.AccessLogger()
-    async with await bed_client.BedEncoderClient.connect(
-        str(fx_medium_vcz.path)
+    sock_path = tmp_path / "plink.sock"
+    async with await plink_client.PlinkClient.start(
+        str(fx_medium_vcz.path), sock_path
     ) as client:
         ops = plink_ops.PlinkOps(client, "medium", access_logger=log)
         async with fuse_adapter.mount(ops, str(mnt)):

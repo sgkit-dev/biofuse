@@ -2,9 +2,9 @@
 
 Exercises the streaming Operations class via direct async-method calls
 — no kernel mount, no subprocess. The vcztools/Zarr-side parity tests
-live in ``test_bed_worker.py`` (against ``WorkerSession`` directly) and
-in ``test_bed_client.py`` (against a real subprocess). End-to-end FUSE
-behaviour against real plink binaries is in ``test_plink_apps.py``.
+live in ``test_plink_server.py`` (against the server module directly)
+and in ``test_plink_client.py`` (against a real subprocess). End-to-end
+FUSE behaviour against real plink binaries is in ``test_plink_apps.py``.
 """
 
 import errno
@@ -13,72 +13,82 @@ import stat
 
 import pyfuse3
 import pytest
-import trio
 
-from biofuse import access_log, bed_protocol, plink_ops
-
-BED = bed_protocol.FileType.BED
-BIM = bed_protocol.FileType.BIM
-FAM = bed_protocol.FileType.FAM
+from biofuse import access_log, plink_ops
 
 
-class _FakeClient:
-    """In-process stand-in for :class:`biofuse.bed_client.BedEncoderClient`.
+class _FakeBedConnection:
+    """In-process stand-in for
+    :class:`biofuse.plink_client.BedConnection`.
 
     Records the call sequence so tests can assert PlinkOps dispatched
     correctly. Reads return deterministic bytes derived from
-    ``(fh, offset, size)``. Errors can be queued via
-    :meth:`raise_on_next`.
+    ``(offset, size)``.
     """
 
-    def __init__(self, sizes: dict[bed_protocol.FileType, int]) -> None:
-        self._sizes = dict(sizes)
-        self._open_handles: dict[int, bed_protocol.FileType] = {}
-        self.calls: list[tuple] = []
-        self._next_error: tuple[str, OSError] | None = None
-        # Optional gate: if set, open() awaits this event before returning.
-        self.open_gate: trio.Event | None = None
+    def __init__(self, conn_id: int, calls: list[tuple]) -> None:
+        self.conn_id = conn_id
+        self._calls = calls
+        self._closed = False
+        self._next_error: OSError | None = None
 
-    @property
-    def file_entries(self) -> dict[bed_protocol.FileType, int]:
-        return dict(self._sizes)
+    def raise_on_next_read(self, exc: OSError) -> None:
+        self._next_error = exc
 
-    def raise_on_next(self, op: str, exc: OSError) -> None:
-        self._next_error = (op, exc)
-
-    def _maybe_raise(self, op: str) -> None:
-        if self._next_error is not None and self._next_error[0] == op:
-            _, exc = self._next_error
+    async def read(self, offset: int, size: int) -> bytes:
+        self._calls.append(("read", self.conn_id, offset, size))
+        if self._next_error is not None:
+            exc = self._next_error
             self._next_error = None
             raise exc
-
-    async def open(self, fh: int, file_type: bed_protocol.FileType) -> None:
-        self.calls.append(("open", fh, file_type))
-        self._maybe_raise("open")
-        if self.open_gate is not None:
-            await self.open_gate.wait()
-        self._open_handles[fh] = file_type
-
-    async def read(self, fh: int, offset: int, size: int) -> bytes:
-        self.calls.append(("read", fh, offset, size))
-        self._maybe_raise("read")
-        if fh not in self._open_handles:
-            raise OSError(errno.EBADF, "unknown handle")
+        if self._closed:
+            raise OSError(errno.EBADF, "connection closed")
         return bytes(((offset + i) & 0xFF) for i in range(size))
 
-    async def release(self, fh: int) -> None:
-        self.calls.append(("release", fh))
-        self._maybe_raise("release")
-        self._open_handles.pop(fh, None)
+    async def aclose(self) -> None:
+        self._calls.append(("aclose", self.conn_id))
+        self._closed = True
 
 
-def _default_sizes() -> dict[bed_protocol.FileType, int]:
-    return {BED: 1024, BIM: 256, FAM: 100}
+class _FakeClient:
+    """In-process stand-in for :class:`biofuse.plink_client.PlinkClient`.
+
+    Holds canned ``bim_bytes`` / ``fam_bytes`` / ``bed_size`` and hands
+    out :class:`_FakeBedConnection` instances on demand.
+    """
+
+    def __init__(
+        self,
+        bim_bytes: bytes = b"BIM" * 64,
+        fam_bytes: bytes = b"FAM" * 32,
+        bed_size: int = 1024,
+    ) -> None:
+        self.bim_bytes = bim_bytes
+        self.fam_bytes = fam_bytes
+        self.bed_size = bed_size
+        self.calls: list[tuple] = []
+        self._next_open_error: OSError | None = None
+        self._next_conn_id = 1
+        self.connections: list[_FakeBedConnection] = []
+
+    def raise_on_next_open(self, exc: OSError) -> None:
+        self._next_open_error = exc
+
+    async def open_bed(self) -> _FakeBedConnection:
+        self.calls.append(("open_bed",))
+        if self._next_open_error is not None:
+            exc = self._next_open_error
+            self._next_open_error = None
+            raise exc
+        conn = _FakeBedConnection(self._next_conn_id, self.calls)
+        self._next_conn_id += 1
+        self.connections.append(conn)
+        return conn
 
 
 @pytest.fixture
 def fx_client():
-    return _FakeClient(_default_sizes())
+    return _FakeClient()
 
 
 @pytest.fixture
@@ -101,11 +111,14 @@ class TestConstructor:
         ops = plink_ops.PlinkOps(fx_client, "alt")
         assert sorted(ops._name_to_inode) == ["alt.bed", "alt.bim", "alt.fam"]
 
-    def test_sizes_match_client_entries(self, fx_ops):
-        sizes = {
-            fx_ops._inode_to_name[i]: size for i, size in fx_ops._inode_to_size.items()
+    def test_sizes_match_client_metadata(self, fx_client):
+        ops = plink_ops.PlinkOps(fx_client, "small")
+        sizes = {ops._inode_to_name[i]: size for i, size in ops._inode_to_size.items()}
+        assert sizes == {
+            "small.bed": fx_client.bed_size,
+            "small.bim": len(fx_client.bim_bytes),
+            "small.fam": len(fx_client.fam_bytes),
         }
-        assert sizes == {"small.bed": 1024, "small.bim": 256, "small.fam": 100}
 
     def test_inodes_assigned_in_sorted_order(self, fx_ops):
         names_in_order = [
@@ -119,20 +132,20 @@ class TestGetattr:
         attrs = await fx_ops.getattr(pyfuse3.ROOT_INODE)
         assert stat.S_ISDIR(attrs.st_mode)
 
-    async def test_regular_file(self, fx_ops):
+    async def test_regular_file(self, fx_ops, fx_client):
         inode = fx_ops._name_to_inode["small.bed"]
         attrs = await fx_ops.getattr(inode)
         assert stat.S_ISREG(attrs.st_mode)
-        assert attrs.st_size == 1024
+        assert attrs.st_size == fx_client.bed_size
 
     async def test_unknown_inode(self, fx_ops):
         await _expect_fuse_error(fx_ops.getattr(9999), errno.ENOENT)
 
 
 class TestLookup:
-    async def test_known_name(self, fx_ops):
+    async def test_known_name(self, fx_ops, fx_client):
         attrs = await fx_ops.lookup(pyfuse3.ROOT_INODE, b"small.bed")
-        assert attrs.st_size == 1024
+        assert attrs.st_size == fx_client.bed_size
 
     async def test_unknown_name(self, fx_ops):
         await _expect_fuse_error(
@@ -205,61 +218,132 @@ class TestOpenFlags:
 
 
 class TestOpenDispatch:
-    async def test_open_calls_client_with_fh_and_type(self, fx_ops, fx_client):
+    async def test_bed_open_creates_bed_connection(self, fx_ops, fx_client):
         inode = fx_ops._name_to_inode["small.bed"]
         info = await fx_ops.open(inode, os.O_RDONLY)
         try:
-            assert ("open", info.fh, BED) in fx_client.calls
-            assert fx_ops._fh_to_type[info.fh] is BED
+            assert fx_client.calls == [("open_bed",)]
+            assert fx_ops._fh_to_kind[info.fh] == "bed"
+            assert info.fh in fx_ops._fh_to_conn
         finally:
             await fx_ops.release(info.fh)
 
-    async def test_each_open_gets_distinct_fh(self, fx_ops):
+    async def test_bim_open_does_not_call_client(self, fx_ops, fx_client):
+        inode = fx_ops._name_to_inode["small.bim"]
+        info = await fx_ops.open(inode, os.O_RDONLY)
+        try:
+            assert fx_client.calls == []
+            assert fx_ops._fh_to_kind[info.fh] == "bim"
+            assert info.fh not in fx_ops._fh_to_conn
+        finally:
+            await fx_ops.release(info.fh)
+
+    async def test_fam_open_does_not_call_client(self, fx_ops, fx_client):
+        inode = fx_ops._name_to_inode["small.fam"]
+        info = await fx_ops.open(inode, os.O_RDONLY)
+        try:
+            assert fx_client.calls == []
+            assert fx_ops._fh_to_kind[info.fh] == "fam"
+            assert info.fh not in fx_ops._fh_to_conn
+        finally:
+            await fx_ops.release(info.fh)
+
+    async def test_each_bed_open_gets_distinct_fh_and_connection(
+        self, fx_ops, fx_client
+    ):
         inode = fx_ops._name_to_inode["small.bed"]
         info1 = await fx_ops.open(inode, os.O_RDONLY)
         info2 = await fx_ops.open(inode, os.O_RDONLY)
         try:
             assert info1.fh != info2.fh
+            assert len(fx_client.connections) == 2
+            assert fx_client.connections[0] is not fx_client.connections[1]
         finally:
             await fx_ops.release(info1.fh)
             await fx_ops.release(info2.fh)
 
-    async def test_open_propagates_oserror_as_fuseerror(self, fx_ops, fx_client):
-        fx_client.raise_on_next("open", OSError(errno.EACCES, "denied"))
+    async def test_bed_open_propagates_oserror_as_fuseerror(self, fx_ops, fx_client):
+        fx_client.raise_on_next_open(OSError(errno.EACCES, "denied"))
         inode = fx_ops._name_to_inode["small.bed"]
         await _expect_fuse_error(fx_ops.open(inode, os.O_RDONLY), errno.EACCES)
 
 
 class TestRead:
-    async def test_read_dispatches_to_client(self, fx_ops, fx_client):
+    async def test_bed_read_dispatches_to_connection(self, fx_ops, fx_client):
         inode = fx_ops._name_to_inode["small.bed"]
         info = await fx_ops.open(inode, os.O_RDONLY)
         try:
             data = await fx_ops.read(info.fh, 16, 8)
-            assert ("read", info.fh, 16, 8) in fx_client.calls
+            assert ("read", 1, 16, 8) in fx_client.calls
             assert data == bytes(((16 + i) & 0xFF) for i in range(8))
+        finally:
+            await fx_ops.release(info.fh)
+
+    async def test_bim_read_serves_from_cached_bytes(self, fx_ops, fx_client):
+        inode = fx_ops._name_to_inode["small.bim"]
+        info = await fx_ops.open(inode, os.O_RDONLY)
+        try:
+            data = await fx_ops.read(info.fh, 0, len(fx_client.bim_bytes))
+            assert data == fx_client.bim_bytes
+            # No client traffic for static reads.
+            assert all(c[0] != "read" for c in fx_client.calls)
+        finally:
+            await fx_ops.release(info.fh)
+
+    async def test_fam_read_serves_from_cached_bytes(self, fx_ops, fx_client):
+        inode = fx_ops._name_to_inode["small.fam"]
+        info = await fx_ops.open(inode, os.O_RDONLY)
+        try:
+            data = await fx_ops.read(info.fh, 0, len(fx_client.fam_bytes))
+            assert data == fx_client.fam_bytes
+        finally:
+            await fx_ops.release(info.fh)
+
+    async def test_bim_read_past_eof_returns_empty(self, fx_ops, fx_client):
+        inode = fx_ops._name_to_inode["small.bim"]
+        info = await fx_ops.open(inode, os.O_RDONLY)
+        try:
+            data = await fx_ops.read(info.fh, len(fx_client.bim_bytes) + 100, 50)
+            assert data == b""
+        finally:
+            await fx_ops.release(info.fh)
+
+    async def test_bim_read_spanning_eof_returns_truncated(self, fx_ops, fx_client):
+        inode = fx_ops._name_to_inode["small.bim"]
+        info = await fx_ops.open(inode, os.O_RDONLY)
+        try:
+            tail_off = len(fx_client.bim_bytes) - 5
+            data = await fx_ops.read(info.fh, tail_off, 100)
+            assert data == fx_client.bim_bytes[tail_off:]
         finally:
             await fx_ops.release(info.fh)
 
     async def test_read_unknown_fh_returns_ebadf(self, fx_ops):
         await _expect_fuse_error(fx_ops.read(9999, 0, 10), errno.EBADF)
 
-    async def test_read_propagates_oserror_as_fuseerror(self, fx_ops, fx_client):
+    async def test_bed_read_propagates_oserror_as_fuseerror(self, fx_ops, fx_client):
         inode = fx_ops._name_to_inode["small.bed"]
         info = await fx_ops.open(inode, os.O_RDONLY)
         try:
-            fx_client.raise_on_next("read", OSError(errno.EIO, "boom"))
+            fx_client.connections[0].raise_on_next_read(OSError(errno.EIO, "boom"))
             await _expect_fuse_error(fx_ops.read(info.fh, 0, 10), errno.EIO)
         finally:
             await fx_ops.release(info.fh)
 
 
 class TestRelease:
-    async def test_release_dispatches_to_client(self, fx_ops, fx_client):
+    async def test_bed_release_closes_connection(self, fx_ops, fx_client):
         inode = fx_ops._name_to_inode["small.bed"]
         info = await fx_ops.open(inode, os.O_RDONLY)
         await fx_ops.release(info.fh)
-        assert ("release", info.fh) in fx_client.calls
+        assert ("aclose", 1) in fx_client.calls
+        assert info.fh not in fx_ops._fh_to_conn
+
+    async def test_static_release_does_not_call_client(self, fx_ops, fx_client):
+        inode = fx_ops._name_to_inode["small.bim"]
+        info = await fx_ops.open(inode, os.O_RDONLY)
+        await fx_ops.release(info.fh)
+        assert all(c[0] != "aclose" for c in fx_client.calls)
 
     async def test_release_unknown_fh_silent(self, fx_ops):
         await fx_ops.release(9999)
@@ -330,9 +414,9 @@ class TestStatfs:
         out = await fx_ops.statfs()
         assert isinstance(out, pyfuse3.StatvfsData)
 
-    async def test_block_count_matches_sum_of_file_sizes(self, fx_ops):
+    async def test_block_count_matches_sum_of_file_sizes(self, fx_ops, fx_client):
         out = await fx_ops.statfs()
-        total = 1024 + 256 + 100  # bed + bim + fam from _default_sizes
+        total = fx_client.bed_size + len(fx_client.bim_bytes) + len(fx_client.fam_bytes)
         assert out.f_bsize > 0
         assert out.f_frsize == out.f_bsize
         assert out.f_blocks == (total + out.f_bsize - 1) // out.f_bsize
@@ -350,55 +434,4 @@ class TestStatfs:
 
     async def test_namemax_is_at_least_posix_min(self, fx_ops):
         out = await fx_ops.statfs()
-        # POSIX _POSIX_NAME_MAX is 14; any sane FS reports much more.
         assert out.f_namemax >= 255
-
-
-class TestCapacityLimiter:
-    """The BED-only capacity limiter throttles concurrent .bed opens
-    without blocking .bim/.fam.
-    """
-
-    async def test_bed_blocks_at_cap(self, fx_client):
-        ops = plink_ops.PlinkOps(fx_client, "small", max_open_bed=2)
-        bed_inode = ops._name_to_inode["small.bed"]
-        info1 = await ops.open(bed_inode, os.O_RDONLY)
-        info2 = await ops.open(bed_inode, os.O_RDONLY)
-
-        third_info = []
-
-        async def third_open():
-            info = await ops.open(bed_inode, os.O_RDONLY)
-            third_info.append(info)
-
-        async with trio.open_nursery() as nursery:
-            nursery.start_soon(third_open)
-            await trio.testing.wait_all_tasks_blocked()
-            assert third_info == []  # blocked at limiter
-            await ops.release(info1.fh)
-            # Releasing one slot lets the third open proceed and the
-            # nursery exits cleanly.
-
-        assert len(third_info) == 1
-        await ops.release(info2.fh)
-        await ops.release(third_info[0].fh)
-
-    async def test_bim_does_not_block_when_bed_at_cap(self, fx_client):
-        ops = plink_ops.PlinkOps(fx_client, "small", max_open_bed=1)
-        bed_inode = ops._name_to_inode["small.bed"]
-        bim_inode = ops._name_to_inode["small.bim"]
-        bed_info = await ops.open(bed_inode, os.O_RDONLY)
-        # cap is 1, BED slot is full; .bim must still proceed.
-        bim_info = await ops.open(bim_inode, os.O_RDONLY)
-        await ops.release(bim_info.fh)
-        await ops.release(bed_info.fh)
-
-    async def test_failed_open_releases_slot(self, fx_client):
-        ops = plink_ops.PlinkOps(fx_client, "small", max_open_bed=1)
-        bed_inode = ops._name_to_inode["small.bed"]
-        # First open fails — slot must be released so the next one can proceed.
-        fx_client.raise_on_next("open", OSError(errno.EACCES, "denied"))
-        await _expect_fuse_error(ops.open(bed_inode, os.O_RDONLY), errno.EACCES)
-        # Second open succeeds (slot was returned).
-        info = await ops.open(bed_inode, os.O_RDONLY)
-        await ops.release(info.fh)
