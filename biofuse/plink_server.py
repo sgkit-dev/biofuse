@@ -16,6 +16,7 @@ import logging
 import select
 import socket
 import threading
+import time
 
 from vcztools import cli as vcztools_cli
 from vcztools import plink as vcztools_plink
@@ -72,6 +73,8 @@ def _handle_connection(conn_sock: socket.socket, session: _ServerSession) -> Non
     The connection's ``BedEncoder`` is allocated lazily on the first
     ``READ`` so the metadata-handshake socket pays no encoder cost.
     """
+    tname = threading.current_thread().name
+    logger.debug("%s: conn accepted", tname)
     encoder: vcztools_plink.BedEncoder | None = None
     try:
         while True:
@@ -96,8 +99,22 @@ def _handle_connection(conn_sock: socket.socket, session: _ServerSession) -> Non
                         return
                     off, size = plink_protocol.parse_read_payload(payload)
                     if encoder is None:
+                        t_enc = time.monotonic()
                         encoder = vcztools_plink.BedEncoder(session.reader)
+                        logger.debug(
+                            "%s: encoder created in %.3fs",
+                            tname,
+                            time.monotonic() - t_enc,
+                        )
+                    t_read = time.monotonic()
                     data = encoder.read(off, size)
+                    logger.debug(
+                        "%s: encoder.read off=%d size=%d in %.3fs",
+                        tname,
+                        off,
+                        size,
+                        time.monotonic() - t_read,
+                    )
                     reply = plink_protocol.pack_read_reply(data)
                 else:
                     logger.warning(
@@ -116,14 +133,22 @@ def _handle_connection(conn_sock: socket.socket, session: _ServerSession) -> Non
                 return
     finally:
         if encoder is not None:
+            t_close = time.monotonic()
+            logger.debug("%s: eof; encoder.close ...", tname)
             try:
                 encoder.close()
             except Exception as exc:  # noqa: BLE001 - best-effort cleanup
                 logger.debug("encoder close raised: %s", exc)
+            logger.debug(
+                "%s: encoder.close done in %.3fs",
+                tname,
+                time.monotonic() - t_close,
+            )
         try:
             conn_sock.close()
         except OSError:
             pass
+        logger.debug("%s: conn thread exit", tname)
 
 
 def serve_forever(
@@ -184,32 +209,42 @@ def serve_forever(
             pass
 
 
-# Per-encoder readahead worker cap. ``vcztools`` defaults to
-# ``min(32, cpu_count())`` workers in each encoder's
-# ``ReadaheadPipeline``; with N concurrent ``.bed`` connections that
-# multiplies into hundreds of threads in this single subprocess and can
-# exhaust the per-process thread limit. We cap conservatively.
-_PER_ENCODER_READAHEAD_WORKERS = 2
-
-
 def _server_main(
     listener_sock: socket.socket,
     stop_sock: socket.socket,
     vcz_url: str,
     backend_storage: str | None,
+    log_level: int = logging.WARNING,
 ) -> None:
     """Subprocess entry point invoked via ``multiprocessing.Process``.
 
     The two sockets are handle-passed by ``multiprocessing`` (the
-    reduction machinery dups the fds into the child).
+    reduction machinery dups the fds into the child). The reader is
+    used as a context manager so its shared ``ThreadPoolExecutor``
+    (one pool per reader, drawn on by every ``BedEncoder`` /
+    ``ReadaheadPipeline``) is drained on the way out.
+
+    ``log_level`` matches the parent's verbosity so the subprocess's
+    own ``logger.debug`` / ``logger.info`` output reaches the same
+    sink as the parent.
     """
-    reader = vcztools_cli.make_reader(vcz_url, backend_storage=backend_storage)
-    reader.readahead_workers = _PER_ENCODER_READAHEAD_WORKERS
-    session = _ServerSession(reader)
-    try:
-        serve_forever(listener_sock, stop_sock, session)
-    finally:
+    # ``force=True`` so the explicitly-passed ``log_level`` wins even
+    # if some upstream import in this subprocess (or the parent's
+    # logging state, replayed via ``spawn``) has already configured
+    # the root logger. Without it, ``basicConfig`` is a no-op and the
+    # subprocess silently keeps the wrong level.
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+    )
+    with vcztools_cli.make_reader(vcz_url, backend_storage=backend_storage) as reader:
+        session = _ServerSession(reader)
         try:
-            stop_sock.close()
-        except OSError:
-            pass
+            serve_forever(listener_sock, stop_sock, session)
+        finally:
+            try:
+                stop_sock.close()
+            except OSError:
+                pass

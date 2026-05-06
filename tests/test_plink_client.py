@@ -240,6 +240,84 @@ class TestClientClose:
         assert not proc.is_alive()
 
 
+class TestTimeouts:
+    """The FUSE handler must never block forever on the worker. These
+    tests pin that property by pointing the client at a deliberately
+    unresponsive server and asserting that ``read`` and ``aclose``
+    surface ``OSError(EIO)`` within a deadline."""
+
+    @staticmethod
+    def _bind_stall_listener(sock_path):
+        """Bind+listen a UNIX socket that will accept exactly one
+        connection inside the test's nursery and then go silent."""
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(sock_path))
+        listener.listen(1)
+        listener.setblocking(False)
+        return listener
+
+    async def _stall_server(self, listener):
+        trio_listener = trio.socket.from_stdlib_socket(listener)
+        conn, _ = await trio_listener.accept()
+        # Hold the connection open with no reads or writes. The test
+        # nursery cancels us at teardown.
+        try:
+            await trio.sleep_forever()
+        finally:
+            conn.close()
+
+    async def _make_stalled_connection(
+        self, sock_path, nursery
+    ) -> plink_client.BedConnection:
+        listener = self._bind_stall_listener(sock_path)
+        nursery.start_soon(self._stall_server, listener)
+        stream = await trio.open_unix_socket(str(sock_path))
+        return plink_client.BedConnection(stream)
+
+    async def test_read_times_out_to_eio(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(plink_client, "_REQUEST_TIMEOUT_S", 0.2)
+        sock_path = tmp_path / "stall.sock"
+        async with trio.open_nursery() as nursery:
+            conn = await self._make_stalled_connection(sock_path, nursery)
+            t0 = trio.current_time()
+            with pytest.raises(OSError, match="plink-server") as excinfo:
+                await conn.read(0, 1024)
+            elapsed = trio.current_time() - t0
+            assert excinfo.value.errno == errno.EIO
+            assert elapsed < 1.0, f"read should fail fast, took {elapsed:.2f}s"
+            nursery.cancel_scope.cancel()
+
+    async def test_read_after_timeout_is_immediate(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(plink_client, "_REQUEST_TIMEOUT_S", 0.2)
+        sock_path = tmp_path / "stall.sock"
+        async with trio.open_nursery() as nursery:
+            conn = await self._make_stalled_connection(sock_path, nursery)
+            with pytest.raises(OSError, match="plink-server"):
+                await conn.read(0, 1024)
+            t0 = trio.current_time()
+            with pytest.raises(OSError, match="bed connection is closed") as excinfo:
+                await conn.read(0, 1024)
+            elapsed = trio.current_time() - t0
+            assert excinfo.value.errno == errno.EIO
+            assert elapsed < 0.05, (
+                f"second read should be immediate, took {elapsed:.3f}s"
+            )
+            nursery.cancel_scope.cancel()
+
+    async def test_aclose_does_not_hang_on_unresponsive_peer(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(plink_client, "_ACLOSE_TIMEOUT_S", 0.2)
+        sock_path = tmp_path / "stall.sock"
+        async with trio.open_nursery() as nursery:
+            conn = await self._make_stalled_connection(sock_path, nursery)
+            t0 = trio.current_time()
+            await conn.aclose()
+            elapsed = trio.current_time() - t0
+            assert elapsed < 1.0, f"aclose should not hang, took {elapsed:.2f}s"
+            nursery.cancel_scope.cancel()
+
+
 class TestRealSubprocess:
     """End-to-end test against a real ``multiprocessing.Process`` worker."""
 

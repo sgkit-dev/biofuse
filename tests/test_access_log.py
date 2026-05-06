@@ -139,6 +139,46 @@ class TestConcurrent:
             json.loads(line)
 
 
+class TestEventKinds:
+    """Lifecycle events (open / release / aclose / limiter_wait) round-trip
+    through the same JSONL writer with a ``kind`` field; existing reads
+    keep ``kind="read"``."""
+
+    def test_read_default_kind(self):
+        logger = access_log.AccessLogger()
+        _record(logger, "a.bed", 1, 0, 100)
+        recs = logger.records
+        assert len(recs) == 1
+        assert recs[0].kind == "read"
+
+    def test_record_event_in_memory(self):
+        logger = access_log.AccessLogger()
+        t0 = time.monotonic()
+        logger.record_event("aclose", "a.bed", 7, t0)
+        recs = logger.records
+        assert len(recs) == 1
+        assert recs[0].kind == "aclose"
+        assert recs[0].path == "a.bed"
+        assert recs[0].fh == 7
+        assert recs[0].offset == 0
+        assert recs[0].size == 0
+        assert recs[0].t_end >= recs[0].t_start
+
+    def test_record_event_jsonl(self, tmp_path):
+        out = tmp_path / "trace.jsonl"
+        with access_log.AccessLogger(out) as logger:
+            t0 = time.monotonic()
+            logger.record_event("open", "a.bed", 1, t0)
+            logger.record_event("release", "a.bed", 1, t0, t_end=t0 + 0.01)
+            _record(logger, "a.bed", 1, 0, 100)
+        lines = out.read_text().splitlines()
+        assert len(lines) == 3
+        kinds = [json.loads(line)["kind"] for line in lines]
+        assert kinds == ["open", "release", "read"]
+        release = json.loads(lines[1])
+        assert release["t_end"] - release["t_start"] == pytest.approx(0.01)
+
+
 class TestRecordValidation:
     @pytest.mark.parametrize(
         ("offset", "size"), [(0, 0), (0, 1), (10, 5), (1 << 40, 4096)]

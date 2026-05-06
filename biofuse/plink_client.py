@@ -13,6 +13,8 @@ import logging
 import multiprocessing as mp
 import pathlib
 import socket
+import time
+from collections.abc import Callable
 
 import trio
 
@@ -25,6 +27,15 @@ _SHUTDOWN_GRACE_SECONDS = 5.0
 _CONNECT_RETRY_SLEEP_S = 0.05
 _CONNECT_DEADLINE_S = 10.0
 
+# Per-operation deadlines for the parent → server protocol. The FUSE
+# handler must never await indefinitely on the worker; on expiry we
+# surface an ``OSError`` to the FUSE layer so the kernel sees a real
+# I/O error and unblocks the consumer's syscall instead of pinning it
+# in uninterruptible sleep.
+_REQUEST_TIMEOUT_S = 30.0
+_OPEN_TIMEOUT_S = 5.0
+_ACLOSE_TIMEOUT_S = 2.0
+
 
 class BedConnection:
     """One ``.bed`` reader: a dedicated socket to the plink-server.
@@ -36,36 +47,77 @@ class BedConnection:
     threads and do not contend with each other.
     """
 
-    def __init__(self, stream: trio.SocketStream) -> None:
+    def __init__(
+        self,
+        stream: trio.SocketStream,
+        *,
+        on_aclose: Callable[[float, float], None] | None = None,
+    ) -> None:
         self._stream = stream
         self._lock = trio.Lock()
         self._closed = False
+        self._on_aclose = on_aclose
 
     async def read(self, off: int, size: int) -> bytes:
         if self._closed:
             raise OSError(errno.EIO, "bed connection is closed")
         request = plink_protocol.pack_read_request(off, size)
-        async with self._lock:
-            await self._stream.send_all(request)
-            status_buf = await _recv_exact(
-                self._stream, plink_protocol.REPLY_STATUS_SIZE
-            )
-            status = plink_protocol.parse_status(status_buf)
-            if status < 0:
-                raise plink_protocol.status_to_error(status)
-            if status == 0:
-                return b""
-            return await _recv_exact(self._stream, status)
+        with trio.move_on_after(_REQUEST_TIMEOUT_S) as cs:
+            async with self._lock:
+                if self._closed:
+                    raise OSError(errno.EIO, "bed connection is closed")
+                await self._stream.send_all(request)
+                status_buf = await _recv_exact(
+                    self._stream, plink_protocol.REPLY_STATUS_SIZE
+                )
+                status = plink_protocol.parse_status(status_buf)
+                if status < 0:
+                    raise plink_protocol.status_to_error(status)
+                if status == 0:
+                    return b""
+                return await _recv_exact(self._stream, status)
+        # Reached only if ``move_on_after`` caught a Cancelled — the
+        # inner block always returns or raises through. Mark the
+        # connection dead so other tasks queued on ``self._lock`` wake
+        # to an immediate EIO instead of repeating the wait against a
+        # known-broken socket.
+        if not cs.cancelled_caught:  # pragma: no cover - defensive
+            raise RuntimeError("plink-server read fall-through")
+        self._closed = True
+        with trio.CancelScope(shield=True):
+            with trio.move_on_after(_ACLOSE_TIMEOUT_S):
+                try:
+                    await self._stream.aclose()
+                except (trio.BrokenResourceError, OSError) as exc:
+                    logger.debug("aclose after timeout raised: %s", exc)
+        raise OSError(errno.EIO, "plink-server request timed out")
 
     async def aclose(self) -> None:
         if self._closed:
             return
         self._closed = True
-        try:
-            await self._stream.send_eof()
-        except (trio.ClosedResourceError, trio.BrokenResourceError, OSError) as exc:
-            logger.debug("send_eof on bed connection raised: %s", exc)
-        await self._stream.aclose()
+        t_start = time.monotonic()
+        with trio.CancelScope(shield=True):
+            with trio.move_on_after(_ACLOSE_TIMEOUT_S) as cs:
+                try:
+                    await self._stream.send_eof()
+                except (
+                    trio.ClosedResourceError,
+                    trio.BrokenResourceError,
+                    OSError,
+                ) as exc:
+                    logger.debug("send_eof on bed connection raised: %s", exc)
+                await self._stream.aclose()
+            if cs.cancelled_caught:
+                logger.debug(
+                    "bed connection aclose timed out after %.1fs",
+                    _ACLOSE_TIMEOUT_S,
+                )
+        if self._on_aclose is not None:
+            try:
+                self._on_aclose(t_start, time.monotonic())
+            except Exception as exc:  # noqa: BLE001 - never let logging blow up cleanup
+                logger.debug("on_aclose hook raised: %s", exc)
 
 
 class PlinkClient:
@@ -95,6 +147,7 @@ class PlinkClient:
         socket_path: pathlib.Path,
         *,
         backend_storage: str | None = None,
+        log_level: int | None = None,
     ) -> "PlinkClient":
         """Spawn the server, run the metadata handshake, return client.
 
@@ -102,6 +155,11 @@ class PlinkClient:
         itself, then hands both to the child. Multiprocessing's socket
         reduction dups the fds across the spawn boundary; the parent
         closes its own copies once the child has started.
+
+        ``log_level`` is forwarded to the subprocess so its
+        ``logger.debug`` / ``info`` output appears in the parent's
+        log sink. If ``None``, the subprocess uses its default
+        (WARNING).
         """
         socket_path = pathlib.Path(socket_path)
         socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -112,9 +170,11 @@ class PlinkClient:
         listener.listen(64)
         parent_stop, child_stop = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         ctx = mp.get_context("spawn")
+        if log_level is None:
+            log_level = logging.getLogger().getEffectiveLevel()
         proc: mp.process.BaseProcess = ctx.Process(
             target=plink_server._server_main,
-            args=(listener, child_stop, vcz_url, backend_storage),
+            args=(listener, child_stop, vcz_url, backend_storage, log_level),
             name="biofuse-plink-server",
         )
         try:
@@ -140,10 +200,14 @@ class PlinkClient:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.aclose()
 
-    async def open_bed(self) -> BedConnection:
+    async def open_bed(
+        self,
+        *,
+        on_aclose: Callable[[float, float], None] | None = None,
+    ) -> BedConnection:
         """Open a new dedicated socket for one ``.bed`` reader."""
         stream = await self._connect_stream()
-        return BedConnection(stream)
+        return BedConnection(stream, on_aclose=on_aclose)
 
     async def aclose(self) -> None:
         """Tear down the server. Idempotent.
@@ -214,8 +278,15 @@ class PlinkClient:
             sock.setblocking(False)
             trio_sock = trio.socket.from_stdlib_socket(sock)
             try:
-                await trio_sock.connect(path)
+                with trio.fail_after(_OPEN_TIMEOUT_S):
+                    await trio_sock.connect(path)
                 return trio.SocketStream(trio_sock)
+            except trio.TooSlowError as exc:
+                trio_sock.close()
+                raise OSError(
+                    errno.EIO,
+                    f"plink-server connect timed out after {_OPEN_TIMEOUT_S:.1f}s",
+                ) from exc
             except (FileNotFoundError, ConnectionRefusedError, OSError) as exc:
                 trio_sock.close()
                 last_exc = exc

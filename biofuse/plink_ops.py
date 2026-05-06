@@ -32,6 +32,12 @@ logger = logging.getLogger(__name__)
 _FILE_MODE = stat.S_IFREG | 0o444
 _DEFAULT_MAX_OPEN_BED = 16
 
+# Maximum time a FUSE_OPEN may wait at the per-mount ``.bed`` capacity
+# limiter. On expiry the open returns ``EAGAIN`` to the kernel rather
+# than blocking forever — this guards against a leaked limiter slot
+# permanently wedging open().
+_LIMITER_TIMEOUT_S = 30.0
+
 
 class _BedConnectionProto(Protocol):
     async def read(self, off: int, size: int) -> bytes: ...
@@ -180,14 +186,22 @@ class PlinkOps(pyfuse3.Operations):
         kind = self._name_to_kind[name]
         fh = self._next_fh
         self._next_fh += 1
+        t_open_start = time.monotonic()
         if kind == "bed":
             # Use the fh itself as the limiter borrower: each open is a
             # distinct logical owner, even when several share the same
             # trio task (true under direct PlinkOps tests, and cheap
             # under pyfuse3 where each request is its own task).
-            await self._bed_limiter.acquire_on_behalf_of(fh)
+            t_limiter_start = time.monotonic()
+            with trio.move_on_after(_LIMITER_TIMEOUT_S) as cs:
+                await self._bed_limiter.acquire_on_behalf_of(fh)
+            t_limiter_end = time.monotonic()
+            if cs.cancelled_caught:
+                raise pyfuse3.FUSEError(errno.EAGAIN)
+            self._record_event("limiter_wait", name, fh, t_limiter_start, t_limiter_end)
             try:
-                conn = await self._client.open_bed()
+                on_aclose = self._make_aclose_recorder(name, fh)
+                conn = await self._client.open_bed(on_aclose=on_aclose)
             except OSError as exc:
                 self._bed_limiter.release_on_behalf_of(fh)
                 raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
@@ -197,7 +211,24 @@ class PlinkOps(pyfuse3.Operations):
             self._fh_to_conn[fh] = conn
         self._fh_to_kind[fh] = kind
         self._fh_to_name[fh] = name
+        self._record_event("open", name, fh, t_open_start)
         return pyfuse3.FileInfo(fh=fh)
+
+    def _record_event(
+        self, kind: str, name: str, fh: int, t_start: float, t_end=None
+    ) -> None:
+        if self._access_logger is not None:
+            self._access_logger.record_event(kind, name, fh, t_start, t_end)
+
+    def _make_aclose_recorder(self, name, fh):
+        if self._access_logger is None:
+            return None
+        access_logger = self._access_logger
+
+        def hook(t_start: float, t_end: float) -> None:
+            access_logger.record_event("aclose", name, fh, t_start, t_end)
+
+        return hook
 
     async def read(self, fh, off, size):
         kind = self._fh_to_kind.get(fh)
@@ -231,10 +262,11 @@ class PlinkOps(pyfuse3.Operations):
 
     async def release(self, fh):
         kind = self._fh_to_kind.pop(fh, None)
-        self._fh_to_name.pop(fh, None)
+        name = self._fh_to_name.pop(fh, None)
         conn = self._fh_to_conn.pop(fh, None)
         if kind is None:
             return
+        t_release_start = time.monotonic()
         try:
             if conn is not None:
                 try:
@@ -244,6 +276,7 @@ class PlinkOps(pyfuse3.Operations):
         finally:
             if kind == "bed":
                 self._bed_limiter.release_on_behalf_of(fh)
+            self._record_event("release", name, fh, t_release_start)
 
     async def forget(self, inode_list):
         return
