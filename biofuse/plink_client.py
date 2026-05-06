@@ -76,12 +76,13 @@ class BedConnection:
                 if status == 0:
                     return b""
                 return await _recv_exact(self._stream, status)
-        # Reached only if move_on_after caught a Cancelled — the
-        # inner block returns successfully or raises through.
-        assert cs.cancelled_caught
-        # Mark the connection dead so other tasks queued on
-        # ``self._lock`` wake up to an immediate EIO instead of
-        # repeating the wait against a known-broken socket.
+        # Reached only if ``move_on_after`` caught a Cancelled — the
+        # inner block always returns or raises through. Mark the
+        # connection dead so other tasks queued on ``self._lock`` wake
+        # to an immediate EIO instead of repeating the wait against a
+        # known-broken socket.
+        if not cs.cancelled_caught:  # pragma: no cover - defensive
+            raise RuntimeError("plink-server read fall-through")
         self._closed = True
         with trio.CancelScope(shield=True):
             with trio.move_on_after(_ACLOSE_TIMEOUT_S):

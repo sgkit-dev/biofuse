@@ -228,10 +228,16 @@ def _server_main(
     own ``logger.debug`` / ``logger.info`` output reaches the same
     sink as the parent.
     """
+    # ``force=True`` so the explicitly-passed ``log_level`` wins even
+    # if some upstream import in this subprocess (or the parent's
+    # logging state, replayed via ``spawn``) has already configured
+    # the root logger. Without it, ``basicConfig`` is a no-op and the
+    # subprocess silently keeps the wrong level.
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s %(name)s %(levelname)s: %(message)s",
         datefmt="%H:%M:%S",
+        force=True,
     )
     with vcztools_cli.make_reader(vcz_url, backend_storage=backend_storage) as reader:
         session = _ServerSession(reader)
