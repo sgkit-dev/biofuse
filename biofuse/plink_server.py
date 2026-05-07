@@ -225,14 +225,34 @@ def _server_main(
     as the parent. ``reader_options`` carries the bcftools-style
     filtering options (regions, samples, …) that vcztools'
     ``make_reader`` consumes.
+
+    Any exception raised before ``serve_forever`` starts (reader
+    construction, ``_ServerSession`` construction — the latter eagerly
+    walks the variants to build ``.bim`` / ``.fam`` and rejects e.g.
+    multi-allelic input) is caught here so multiprocessing's default
+    handler does not print a traceback. The cause is logged at ERROR
+    (visible at default verbosity); the traceback only surfaces at
+    DEBUG.
     """
     log_config.apply()
-    with vcztools_cli.make_reader_from_options(vcz_url, reader_options) as reader:
-        session = _ServerSession(reader)
-        try:
-            serve_forever(listener_sock, stop_sock, session)
-        finally:
+    try:
+        with vcztools_cli.make_reader_from_options(vcz_url, reader_options) as reader:
+            session = _ServerSession(reader)
             try:
-                stop_sock.close()
-            except OSError:
-                pass
+                serve_forever(listener_sock, stop_sock, session)
+            finally:
+                try:
+                    stop_sock.close()
+                except OSError:
+                    pass
+    except Exception as exc:  # noqa: BLE001 - cleanly surface any startup failure
+        logger.error("plink-server startup failed: %s", exc)
+        logger.debug("plink-server startup traceback", exc_info=True)
+        try:
+            listener_sock.close()
+        except OSError:
+            pass
+        try:
+            stop_sock.close()
+        except OSError:
+            pass

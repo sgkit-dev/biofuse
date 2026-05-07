@@ -321,6 +321,24 @@ class TestTimeouts:
 class TestRealSubprocess:
     """End-to-end test against a real ``multiprocessing.Process`` worker."""
 
+    async def test_start_fast_fails_on_subprocess_startup_error(
+        self, fx_multiallelic_vcz, tmp_path
+    ):
+        """``PlinkClient.start()`` must surface a clean ``OSError`` and
+        return well under the 10 s connect deadline when the subprocess
+        catches a startup error (here: multi-allelic VCZ) and exits."""
+        socket_path = tmp_path / "plink.sock"
+        t0 = trio.current_time()
+        with pytest.raises(OSError, match="exited during startup") as excinfo:
+            await plink_client.PlinkClient.start(
+                str(fx_multiallelic_vcz.path), socket_path
+            )
+        elapsed = trio.current_time() - t0
+        assert excinfo.value.errno == errno.EIO
+        assert elapsed < plink_client._CONNECT_DEADLINE_S, (
+            f"start() should fast-fail when child dies, took {elapsed:.2f}s"
+        )
+
     async def test_spawn_handshake_open_read_close(
         self, fx_small_vcz, fx_golden_dir, tmp_path
     ):

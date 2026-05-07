@@ -49,12 +49,15 @@ def simulate_vcz(
     samples_chunk_size: int,
     name: str = "sim",
     seed: int = 1,
+    biallelic: bool = True,
 ) -> VczFixture:
     """Simulate a tree sequence and convert it to VCZ on disk.
 
     Returns a VczFixture pointing at a directory-format VCZ. The caller
-    owns cleanup of out_dir. The fixture is guaranteed biallelic: any
-    site with multiple mutations keeps only its first mutation.
+    owns cleanup of out_dir. By default the fixture is biallelic: any
+    site with multiple mutations keeps only its first mutation. Pass
+    ``biallelic=False`` to keep recurrent mutations and exercise the
+    multi-allelic rejection path.
     """
     ts = msprime.sim_ancestry(
         samples=num_diploid_samples,
@@ -67,7 +70,8 @@ def simulate_vcz(
         rate=mutation_rate,
         random_seed=seed + 1,
     )
-    ts = _keep_first_mutation_per_site(ts)
+    if biallelic:
+        ts = _keep_first_mutation_per_site(ts)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     vcz_path = out_dir / f"{name}.vcz"

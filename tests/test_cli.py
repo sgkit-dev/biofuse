@@ -184,6 +184,37 @@ class TestEndToEndMount:
         finally:
             self._terminate(proc, mnt)
 
+    def test_multiallelic_vcz_clean_error(self, tmp_path, fx_multiallelic_vcz):
+        """A multi-allelic VCZ must surface as a single clean error line
+        with no Python traceback. The plink-server logs the helpful cause
+        ('Multi-allelic ...') at ERROR; the parent emits a Click
+        'Error: ...' line and exits non-zero."""
+        mnt = tmp_path / "mnt"
+        mnt.mkdir()
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "biofuse.cli",
+                "mount-plink",
+                str(fx_multiallelic_vcz.path),
+                str(mnt),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise
+        stderr_text = stderr.decode()
+        assert proc.returncode != 0
+        assert "Traceback (most recent call last)" not in stderr_text
+        assert "Multi-allelic" in stderr_text
+        assert "Error:" in stderr_text
+        assert not os.path.ismount(mnt)
+
     @staticmethod
     def _wait_for_mount(mnt: pathlib.Path, proc, timeout: float) -> None:
         deadline = time.monotonic() + timeout

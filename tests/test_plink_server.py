@@ -345,6 +345,55 @@ class TestServeForever:
             s.connect(str(sock_path))
 
 
+class TestServerMainStartupFailure:
+    """``_server_main`` must catch its own startup exceptions so the
+    multiprocessing subprocess exits cleanly (no Python traceback printed
+    to stderr) when the VCZ cannot be served — e.g. multi-allelic
+    input."""
+
+    def test_multiallelic_subprocess_exits_cleanly(self, fx_multiallelic_vcz, tmp_path):
+        sock_path = tmp_path / "plink.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(sock_path))
+        listener.listen(8)
+        parent_stop, child_stop = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        ctx = mp.get_context("spawn")
+        proc = ctx.Process(
+            target=plink_server._server_main,
+            args=(
+                listener,
+                child_stop,
+                str(fx_multiallelic_vcz.path),
+                vcztools_cli.ViewBedOptions(),
+                vcztools_cli.LogConfig(),
+            ),
+        )
+        proc.start()
+        listener.close()
+        child_stop.close()
+        try:
+            proc.join(timeout=30)
+            assert not proc.is_alive(), "subprocess did not exit"
+            assert proc.exitcode == 0, (
+                f"subprocess exited with {proc.exitcode}; expected 0 "
+                "(_server_main should catch startup errors and return)"
+            )
+            client_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client_sock.settimeout(1)
+            with pytest.raises((ConnectionRefusedError, FileNotFoundError)):
+                client_sock.connect(str(sock_path))
+            client_sock.close()
+        finally:
+            parent_stop.close()
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=5)
+            try:
+                os.unlink(sock_path)
+            except OSError:
+                pass
+
+
 class TestServerMainSmoke:
     """End-to-end check that ``_server_main`` runs in a real subprocess."""
 

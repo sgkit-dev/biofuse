@@ -193,8 +193,19 @@ class PlinkClient:
         self._stop_sock = parent_stop
         try:
             await self._handshake()
-        except BaseException:
+        except BaseException as exc:
             await self.aclose()
+            # If the subprocess has exited during startup the handshake
+            # failure is a downstream symptom (refused connect, RST mid
+            # frame, premature EOF). Surface a single clean OSError so
+            # the CLI prints one error line and points the user at the
+            # server's own log, instead of leaking the trio / socket
+            # exception type to the caller.
+            if proc.exitcode is not None and not isinstance(exc, KeyboardInterrupt):
+                raise OSError(
+                    errno.EIO,
+                    "plink-server exited during startup; see log above for details",
+                ) from exc
             raise
         return self
 
@@ -271,7 +282,10 @@ class PlinkClient:
 
         With ``retry_until_listening=True`` the call retries briefly
         while the child is still bringing up its accept loop, bounded
-        by ``_CONNECT_DEADLINE_S``.
+        by ``_CONNECT_DEADLINE_S``. If the child has already exited
+        (typically due to a startup failure that ``_server_main``
+        caught and logged) the retry loop bails out immediately
+        instead of waiting out the deadline.
         """
         assert self._socket_path is not None
         path = str(self._socket_path)
@@ -296,6 +310,11 @@ class PlinkClient:
                 last_exc = exc
                 if not retry_until_listening:
                     raise
+                if self._proc is not None and not self._proc.is_alive():
+                    raise OSError(
+                        errno.EIO,
+                        "plink-server exited during startup; see log above for details",
+                    ) from last_exc
                 if trio.current_time() > deadline:
                     raise OSError(
                         errno.EIO,
