@@ -23,6 +23,8 @@ def handle_exception(func):
             return func(*args, **kwargs)
         except (ValueError, FileNotFoundError, NotADirectoryError) as e:
             raise click.ClickException(str(e)) from e
+        except OSError as e:
+            raise click.ClickException(e.strerror or str(e)) from e
 
     return wrapper
 

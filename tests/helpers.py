@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import bio2zarr.tskit as bio2zarr_tskit
 import msprime
 import numpy as np
+import zarr
 
 
 @dataclass(frozen=True)
@@ -15,8 +16,26 @@ class VczFixture:
     path: pathlib.Path
     num_samples: int
     num_variants: int
+    num_biallelic_sites: int
     variants_chunk_size: int
     samples_chunk_size: int
+
+
+def _count_biallelic_sites(vcz_path: pathlib.Path) -> int:
+    """Count sites a ``--max-alleles 2`` filter would keep.
+
+    Mirrors :func:`vcztools.plink._check_biallelic`: a site is
+    biallelic-acceptable iff every ``variant_allele`` column past index
+    1 is empty (so ``alleles.shape[1] < 3`` short-circuits to "all
+    biallelic").
+    """
+    store = zarr.open(vcz_path, mode="r")
+    alleles = store["variant_allele"][:]
+    if alleles.shape[1] < 3:
+        return int(alleles.shape[0])
+    extras = alleles[:, 2:]
+    biallelic_mask = np.all(extras == "", axis=1)
+    return int(np.sum(biallelic_mask))
 
 
 def _keep_first_mutation_per_site(ts):
@@ -49,12 +68,15 @@ def simulate_vcz(
     samples_chunk_size: int,
     name: str = "sim",
     seed: int = 1,
+    biallelic: bool = True,
 ) -> VczFixture:
     """Simulate a tree sequence and convert it to VCZ on disk.
 
     Returns a VczFixture pointing at a directory-format VCZ. The caller
-    owns cleanup of out_dir. The fixture is guaranteed biallelic: any
-    site with multiple mutations keeps only its first mutation.
+    owns cleanup of out_dir. By default the fixture is biallelic: any
+    site with multiple mutations keeps only its first mutation. Pass
+    ``biallelic=False`` to keep recurrent mutations and exercise the
+    multi-allelic rejection path.
     """
     ts = msprime.sim_ancestry(
         samples=num_diploid_samples,
@@ -67,7 +89,8 @@ def simulate_vcz(
         rate=mutation_rate,
         random_seed=seed + 1,
     )
-    ts = _keep_first_mutation_per_site(ts)
+    if biallelic:
+        ts = _keep_first_mutation_per_site(ts)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     vcz_path = out_dir / f"{name}.vcz"
@@ -84,6 +107,7 @@ def simulate_vcz(
         path=vcz_path,
         num_samples=num_samples,
         num_variants=num_variants,
+        num_biallelic_sites=_count_biallelic_sites(vcz_path),
         variants_chunk_size=variants_chunk_size,
         samples_chunk_size=samples_chunk_size,
     )

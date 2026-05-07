@@ -16,6 +16,7 @@ import threading
 
 import pytest
 import trio
+from vcztools import cli as vcztools_cli
 from vcztools.cli import make_reader
 from vcztools.plink import write_plink
 
@@ -320,6 +321,64 @@ class TestTimeouts:
 
 class TestRealSubprocess:
     """End-to-end test against a real ``multiprocessing.Process`` worker."""
+
+    async def test_start_fast_fails_on_subprocess_startup_error(
+        self, fx_multiallelic_vcz, tmp_path
+    ):
+        """``PlinkClient.start()`` must surface a clean ``OSError`` and
+        return well under the 10 s connect deadline when the subprocess
+        catches a startup error (here: multi-allelic VCZ) and exits."""
+        socket_path = tmp_path / "plink.sock"
+        t0 = trio.current_time()
+        with pytest.raises(OSError, match="exited during startup") as excinfo:
+            await plink_client.PlinkClient.start(
+                str(fx_multiallelic_vcz.path), socket_path
+            )
+        elapsed = trio.current_time() - t0
+        assert excinfo.value.errno == errno.EIO
+        assert elapsed < plink_client._CONNECT_DEADLINE_S, (
+            f"start() should fast-fail when child dies, took {elapsed:.2f}s"
+        )
+
+    async def test_max_alleles_filter_through_start(
+        self, fx_multiallelic_vcz, tmp_path
+    ):
+        """``ViewBedOptions(max_alleles=2)`` flows through the
+        multiprocessing spawn into the worker's ``make_reader_from_options``
+        and drops multi-allelic variants, so the handshake succeeds and
+        the metadata reflects the filtered variant count."""
+        # Sanity: the fixture really is multi-allelic, otherwise the
+        # filter has nothing to drop and the test isn't testing anything.
+        assert fx_multiallelic_vcz.num_biallelic_sites < (
+            fx_multiallelic_vcz.num_variants
+        )
+        socket_path = tmp_path / "plink.sock"
+        client = await plink_client.PlinkClient.start(
+            str(fx_multiallelic_vcz.path),
+            socket_path,
+            reader_options=vcztools_cli.ViewBedOptions(max_alleles=2),
+        )
+        try:
+            bim_lines = client.bim_bytes.decode("utf-8").splitlines()
+            assert len(bim_lines) == fx_multiallelic_vcz.num_biallelic_sites
+            fam_lines = client.fam_bytes.decode("utf-8").splitlines()
+            assert len(fam_lines) == fx_multiallelic_vcz.num_samples
+            bytes_per_variant = (fx_multiallelic_vcz.num_samples + 3) // 4
+            expected_bed_size = (
+                3 + fx_multiallelic_vcz.num_biallelic_sites * bytes_per_variant
+            )
+            assert client.bed_size == expected_bed_size
+            conn = await client.open_bed()
+            try:
+                data = await conn.read(0, expected_bed_size)
+                assert len(data) == expected_bed_size
+            finally:
+                await conn.aclose()
+        finally:
+            await client.aclose()
+        assert isinstance(client._proc, mp.process.BaseProcess)
+        assert not client._proc.is_alive()
+        assert client._proc.exitcode == 0
 
     async def test_spawn_handshake_open_read_close(
         self, fx_small_vcz, fx_golden_dir, tmp_path

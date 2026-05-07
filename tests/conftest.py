@@ -64,3 +64,24 @@ def fx_singleton_vcz(fx_session_dir) -> helpers.VczFixture:
         name="singleton",
         seed=37,
     )
+
+
+@pytest.fixture(scope="session")
+def fx_multiallelic_vcz(fx_session_dir) -> helpers.VczFixture:
+    """VCZ with recurrent mutations, i.e. multi-allelic sites.
+
+    Used to exercise the plink-server's startup-failure path: PLINK 1
+    binary output cannot represent >2 alleles, so ``generate_bim``
+    raises ``ValueError`` during session construction.
+    """
+    return helpers.simulate_vcz(
+        out_dir=fx_session_dir / "multiallelic",
+        num_diploid_samples=10,
+        sequence_length=10_000,
+        mutation_rate=1e-2,
+        variants_chunk_size=10,
+        samples_chunk_size=10,
+        name="multiallelic",
+        seed=53,
+        biallelic=False,
+    )
