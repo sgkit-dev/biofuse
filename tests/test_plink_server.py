@@ -7,6 +7,7 @@ real-subprocess smoke test exercises ``_server_main`` to validate
 the multiprocessing fd-passing handshake.
 """
 
+import errno
 import multiprocessing as mp
 import os
 import pathlib
@@ -180,6 +181,45 @@ class TestHandleConnectionRead:
                 parent.close()
             except OSError:
                 pass
+
+
+class TestHandleConnectionEncoderConstructionFailure:
+    """Errors raised while constructing the per-connection ``BedEncoder``
+    must surface as an errno reply on the wire — the parent layer relies
+    on this to translate failures into a real ``OSError`` rather than an
+    unexplained EOF."""
+
+    def test_oserror_returns_matching_errno(self, fx_session, monkeypatch):
+        class _BoomEncoder:
+            def __init__(self, *args, **kwargs):
+                raise OSError(errno.EACCES, "boom")
+
+        monkeypatch.setattr(plink_server.vcztools_plink, "BedEncoder", _BoomEncoder)
+        parent, thread = _spawn_handle_connection(fx_session)
+        try:
+            status, body = _read_status_and_body(parent)
+            assert status == -errno.EACCES
+            assert body == b""
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+        finally:
+            parent.close()
+
+    def test_other_exception_returns_eio(self, fx_session, monkeypatch):
+        class _BoomEncoder:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError("not an OSError")
+
+        monkeypatch.setattr(plink_server.vcztools_plink, "BedEncoder", _BoomEncoder)
+        parent, thread = _spawn_handle_connection(fx_session)
+        try:
+            status, body = _read_status_and_body(parent)
+            assert status == -errno.EIO
+            assert body == b""
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+        finally:
+            parent.close()
 
 
 class TestServeForever:

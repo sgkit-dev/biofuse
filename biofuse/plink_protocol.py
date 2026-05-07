@@ -16,10 +16,8 @@ Two request shapes
     (``= 24 + bim_size + fam_size``).
 
 ``R off:Q size:Q`` (17 bytes) — read ``size`` bytes at ``off`` from
-    the connection's ``.bed`` view. The encoder is created lazily
-    on the first ``R`` for this socket, so the metadata-handshake
-    socket can be discarded without paying the encoder-build cost.
-    Reply body is the data bytes; ``status`` is the body length.
+    the connection's ``.bed`` view. Reply body is the data bytes;
+    ``status`` is the body length.
 
 Reply layout (common)
 ---------------------
