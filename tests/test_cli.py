@@ -184,6 +184,49 @@ class TestEndToEndMount:
         finally:
             self._terminate(proc, mnt)
 
+    def test_max_alleles_filter_admits_multiallelic(
+        self, tmp_path, fx_multiallelic_vcz
+    ):
+        """``--max-alleles 2`` (the workaround the error message
+        recommends) flows through to vcztools' reader and drops the
+        multi-allelic sites before the BedEncoder sees them, so the
+        mount succeeds with a smaller variant set."""
+        # Sanity: the fixture really does contain multi-allelic sites,
+        # otherwise the test couldn't prove the filter ran.
+        assert fx_multiallelic_vcz.num_biallelic_sites < (
+            fx_multiallelic_vcz.num_variants
+        )
+        mnt = tmp_path / "mnt"
+        mnt.mkdir()
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "biofuse.cli",
+                "mount-plink",
+                str(fx_multiallelic_vcz.path),
+                str(mnt),
+                "--max-alleles",
+                "2",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            self._wait_for_mount(mnt, proc, timeout=30)
+            bim_text = (mnt / "multiallelic.bim").read_text()
+            bim_lines = bim_text.splitlines()
+            assert len(bim_lines) == fx_multiallelic_vcz.num_biallelic_sites
+            fam_lines = (mnt / "multiallelic.fam").read_text().splitlines()
+            assert len(fam_lines) == fx_multiallelic_vcz.num_samples
+            bytes_per_variant = (fx_multiallelic_vcz.num_samples + 3) // 4
+            expected_bed_size = (
+                3 + fx_multiallelic_vcz.num_biallelic_sites * bytes_per_variant
+            )
+            assert (mnt / "multiallelic.bed").stat().st_size == expected_bed_size
+        finally:
+            self._terminate(proc, mnt)
+
     def test_multiallelic_vcz_clean_error(self, tmp_path, fx_multiallelic_vcz):
         """A multi-allelic VCZ must surface as a single clean error line
         with no Python traceback. The plink-server logs the helpful cause

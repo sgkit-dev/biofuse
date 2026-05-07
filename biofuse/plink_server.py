@@ -41,10 +41,13 @@ class _ServerSession:
         fam_text = vcztools_plink.generate_fam(reader)
         self.bim_bytes = bim_text.encode("utf-8")
         self.fam_bytes = fam_text.encode("utf-8")
-        num_variants = reader.num_variants
+        # ``reader.num_variants`` is the raw store count; with a
+        # variant-chunk plan in effect (set_variants / materialised
+        # filter) the BedEncoder emits one row per *planned* variant.
+        num_planned_variants = int(reader.variant_counts_per_chunk().sum())
         num_samples = int(reader.sample_ids.size)
         bytes_per_variant = (num_samples + 3) // 4
-        self.bed_size = 3 + num_variants * bytes_per_variant
+        self.bed_size = 3 + num_planned_variants * bytes_per_variant
 
 
 def _recv_exact_sync(sock: socket.socket, n: int) -> bytes:
@@ -237,6 +240,14 @@ def _server_main(
     log_config.apply()
     try:
         with vcztools_cli.make_reader_from_options(vcz_url, reader_options) as reader:
+            # Bcftools-style filters (--max-alleles, --types, --include,
+            # …) configure a per-variant predicate via
+            # ``reader.set_variant_filter``; vcztools' ``BedEncoder``
+            # refuses readers in that state. Resolve the predicate now
+            # into a fixed surviving-variant chunk plan so each
+            # connection's encoder sees a plain reader. No-op when no
+            # variant filter is configured.
+            reader.materialise_variant_filter()
             session = _ServerSession(reader)
             try:
                 serve_forever(listener_sock, stop_sock, session)
