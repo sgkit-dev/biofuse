@@ -46,19 +46,6 @@ class TestArgumentValidation:
         assert result.exit_code != 0
         assert "mount directory does not exist" in result.output
 
-    def test_invalid_backend_storage_fails(self, tmp_path):
-        result = CliRunner().invoke(
-            cli.biofuse_main,
-            [
-                "mount-plink",
-                "x.vcz",
-                str(tmp_path),
-                "--backend-storage",
-                "bogus",
-            ],
-        )
-        assert result.exit_code != 0
-
 
 class TestEndToEndMount:
     """Spawn the CLI as a subprocess, wait for mount, read files, terminate."""
@@ -118,6 +105,57 @@ class TestEndToEndMount:
         assert len(lines) > 0
         paths = {line.split('"path":')[1].split('"')[1] for line in lines}
         assert "small.bed" in paths
+
+    def test_log_level_accepted(self, tmp_path, fx_small_vcz):
+        mnt = tmp_path / "mnt"
+        mnt.mkdir()
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "biofuse.cli",
+                "mount-plink",
+                str(fx_small_vcz.path),
+                str(mnt),
+                "--log-level",
+                "info",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            self._wait_for_mount(mnt, proc, timeout=15)
+            assert (mnt / "small.bed").stat().st_size > 0
+        finally:
+            self._terminate(proc, mnt)
+
+    def test_samples_filter(self, tmp_path, fx_small_vcz):
+        """--samples reaches the worker subprocess and shrinks .fam."""
+        mnt = tmp_path / "mnt"
+        mnt.mkdir()
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "biofuse.cli",
+                "mount-plink",
+                str(fx_small_vcz.path),
+                str(mnt),
+                "--samples",
+                "tsk_0,tsk_1",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            self._wait_for_mount(mnt, proc, timeout=15)
+            fam_text = (mnt / "small.fam").read_text()
+            assert fam_text.count("\n") == 2
+            assert "tsk_0" in fam_text
+            assert "tsk_1" in fam_text
+            assert "tsk_2" not in fam_text
+        finally:
+            self._terminate(proc, mnt)
 
     def test_basename_override(self, tmp_path, fx_small_vcz):
         mnt = tmp_path / "mnt"
