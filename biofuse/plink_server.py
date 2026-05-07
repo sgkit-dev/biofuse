@@ -70,85 +70,81 @@ def _recv_exact_sync(sock: socket.socket, n: int) -> bytes:
 def _handle_connection(conn_sock: socket.socket, session: _ServerSession) -> None:
     """Run one client connection synchronously. Returns on EOF.
 
-    The connection's ``BedEncoder`` is allocated lazily on the first
-    ``READ`` so the metadata-handshake socket pays no encoder cost.
+    A ``BedEncoder`` is constructed up front for every connection and
+    its lifetime is bound to the connection via a ``with`` block. If
+    construction fails, an errno reply is written to the socket so the
+    client surfaces a real ``OSError`` rather than an unexplained EOF.
     """
     tname = threading.current_thread().name
     logger.debug("%s: conn accepted", tname)
-    encoder: vcztools_plink.BedEncoder | None = None
-    try:
-        while True:
-            try:
-                tag_buf = _recv_exact_sync(conn_sock, 1)
-            except EOFError as exc:
-                logger.warning("plink-server frame error: %s", exc)
-                return
-            if len(tag_buf) == 0:
-                return
-            tag = bytes(tag_buf)
-            try:
-                if tag == plink_protocol.TAG_GET_METADATA:
-                    reply = plink_protocol.pack_metadata_reply(
-                        session.bim_bytes, session.fam_bytes, session.bed_size
-                    )
-                elif tag == plink_protocol.TAG_READ:
-                    payload = _recv_exact_sync(
-                        conn_sock, plink_protocol.REQ_READ_PAYLOAD_SIZE
-                    )
-                    if len(payload) < plink_protocol.REQ_READ_PAYLOAD_SIZE:
-                        return
-                    off, size = plink_protocol.parse_read_payload(payload)
-                    if encoder is None:
-                        t_enc = time.monotonic()
-                        encoder = vcztools_plink.BedEncoder(session.reader)
-                        logger.debug(
-                            "%s: encoder created in %.3fs",
-                            tname,
-                            time.monotonic() - t_enc,
-                        )
-                    t_read = time.monotonic()
-                    data = encoder.read(off, size)
-                    logger.debug(
-                        "%s: encoder.read off=%d size=%d in %.3fs",
-                        tname,
-                        off,
-                        size,
-                        time.monotonic() - t_read,
-                    )
-                    reply = plink_protocol.pack_read_reply(data)
-                else:
-                    logger.warning(
-                        "plink-server: unknown tag %r; closing connection", tag
-                    )
-                    return
-            except Exception as exc:  # noqa: BLE001 - any error becomes errno reply
-                err = plink_protocol.errno_for_exception(exc)
-                if not isinstance(exc, OSError):
-                    logger.exception("plink-server dispatch raised; replying with EIO")
-                reply = plink_protocol.pack_error_reply(err)
-            try:
-                conn_sock.sendall(reply)
-            except OSError as exc:
-                logger.warning("plink-server send failed: %s", exc)
-                return
-    finally:
-        if encoder is not None:
-            t_close = time.monotonic()
-            logger.debug("%s: eof; encoder.close ...", tname)
-            try:
-                encoder.close()
-            except Exception as exc:  # noqa: BLE001 - best-effort cleanup
-                logger.debug("encoder close raised: %s", exc)
-            logger.debug(
-                "%s: encoder.close done in %.3fs",
-                tname,
-                time.monotonic() - t_close,
-            )
+    with conn_sock:
         try:
-            conn_sock.close()
-        except OSError:
-            pass
-        logger.debug("%s: conn thread exit", tname)
+            t_enc = time.monotonic()
+            encoder_cm = vcztools_plink.BedEncoder(session.reader)
+        except Exception as exc:  # noqa: BLE001 - any error becomes errno reply
+            err = plink_protocol.errno_for_exception(exc)
+            if not isinstance(exc, OSError):
+                logger.exception(
+                    "plink-server BedEncoder construction failed; replying with errno"
+                )
+            try:
+                conn_sock.sendall(plink_protocol.pack_error_reply(err))
+            except OSError as send_exc:
+                logger.warning("plink-server send failed: %s", send_exc)
+            return
+        with encoder_cm as encoder:
+            logger.debug(
+                "%s: encoder created in %.3fs", tname, time.monotonic() - t_enc
+            )
+            while True:
+                try:
+                    tag_buf = _recv_exact_sync(conn_sock, 1)
+                except EOFError as exc:
+                    logger.warning("plink-server frame error: %s", exc)
+                    return
+                if len(tag_buf) == 0:
+                    return
+                tag = bytes(tag_buf)
+                try:
+                    if tag == plink_protocol.TAG_GET_METADATA:
+                        reply = plink_protocol.pack_metadata_reply(
+                            session.bim_bytes, session.fam_bytes, session.bed_size
+                        )
+                    elif tag == plink_protocol.TAG_READ:
+                        payload = _recv_exact_sync(
+                            conn_sock, plink_protocol.REQ_READ_PAYLOAD_SIZE
+                        )
+                        if len(payload) < plink_protocol.REQ_READ_PAYLOAD_SIZE:
+                            return
+                        off, size = plink_protocol.parse_read_payload(payload)
+                        t_read = time.monotonic()
+                        data = encoder.read(off, size)
+                        logger.debug(
+                            "%s: encoder.read off=%d size=%d in %.3fs",
+                            tname,
+                            off,
+                            size,
+                            time.monotonic() - t_read,
+                        )
+                        reply = plink_protocol.pack_read_reply(data)
+                    else:
+                        logger.warning(
+                            "plink-server: unknown tag %r; closing connection", tag
+                        )
+                        return
+                except Exception as exc:  # noqa: BLE001 - any error becomes errno reply
+                    err = plink_protocol.errno_for_exception(exc)
+                    if not isinstance(exc, OSError):
+                        logger.exception(
+                            "plink-server dispatch raised; replying with EIO"
+                        )
+                    reply = plink_protocol.pack_error_reply(err)
+                try:
+                    conn_sock.sendall(reply)
+                except OSError as exc:
+                    logger.warning("plink-server send failed: %s", exc)
+                    return
+    logger.debug("%s: conn thread exit", tname)
 
 
 def serve_forever(
