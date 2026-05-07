@@ -45,10 +45,13 @@ press Ctrl-C to unmount.
 Options:
 
 - `--basename NAME` — basename for the plink fileset (defaults to the VCZ stem).
-- `--backend-storage {fsspec,obstore,icechunk}` — backend for remote VCZ URLs.
 - `--access-log PATH` — record every read as a JSONL row to PATH (useful for
   characterising consumer access patterns).
-- `-v` / `-vv` — increase logging verbosity.
+- The bcftools-view-style filter / backend / log options
+  (`-r`/`-R`/`-s`/`-S`/`-t`/`-T`/`-i`/`-e`/`-v`/`-V`/`-m`/`-M`,
+  `--backend-storage`, `--storage-option`, `--log-level`, `--log-file`)
+  are inherited from `vcztools view-bed`. Run `biofuse mount-plink --help`
+  or see `vcztools view-bed --help` for the full reference.
 
 Example:
 

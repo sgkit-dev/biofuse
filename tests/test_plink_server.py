@@ -16,6 +16,7 @@ import threading
 import time
 
 import pytest
+from vcztools import cli as vcztools_cli
 from vcztools.cli import make_reader
 from vcztools.plink import write_plink
 
@@ -316,7 +317,13 @@ class TestServerMainSmoke:
         ctx = mp.get_context("spawn")
         proc = ctx.Process(
             target=plink_server._server_main,
-            args=(listener, child_stop, str(fx_small_vcz.path), None),
+            args=(
+                listener,
+                child_stop,
+                str(fx_small_vcz.path),
+                vcztools_cli.ViewBedOptions(),
+                vcztools_cli.LogConfig(),
+            ),
         )
         proc.start()
         listener.close()

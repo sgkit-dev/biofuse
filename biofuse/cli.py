@@ -9,20 +9,11 @@ from functools import wraps
 
 import click
 import trio
+from vcztools import cli as vcztools_cli
 
 from biofuse import access_log, fuse_adapter, plink_client, plink_ops
 
 logger = logging.getLogger(__name__)
-
-
-def _setup_logging(verbosity: int) -> None:
-    levels = [logging.WARNING, logging.INFO, logging.DEBUG]
-    level = levels[min(verbosity, len(levels) - 1)]
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
 
 
 def handle_exception(func):
@@ -46,18 +37,6 @@ def _default_basename(vcz_url: str) -> str:
         name = stem
 
 
-verbose = click.option(
-    "-v",
-    "--verbose",
-    count=True,
-    help="Increase logging verbosity (-v info, -vv debug).",
-)
-backend_storage = click.option(
-    "--backend-storage",
-    type=click.Choice(["fsspec", "obstore", "icechunk"]),
-    default=None,
-    help="Backend storage to use for remote VCZ URLs.",
-)
 access_log_opt = click.option(
     "--access-log",
     "access_log_path",
@@ -86,13 +65,11 @@ def biofuse_main():
     type=click.Path(file_okay=False, dir_okay=True, path_type=str),
 )
 @basename_opt
-@backend_storage
+@vcztools_cli.view_bed_options
 @access_log_opt
-@verbose
+@vcztools_cli.log_options
 @handle_exception
-def mount_plink(
-    vcz_url, mount_dir, basename, backend_storage, access_log_path, verbose
-):
+def mount_plink(vcz_url, mount_dir, basename, access_log_path, **kwargs):
     """Mount a PLINK 1.9 view of VCZ_URL at MOUNT_DIR.
 
     Spawns a plink-server subprocess that owns the ``VczReader`` and
@@ -100,9 +77,16 @@ def mount_plink(
     ``.fam`` are precomputed once at mount time and held in the FUSE
     process's memory; only ``.bed`` reads cross the wire.
 
+    The bcftools-view-style filter / backend / log options are inherited
+    from ``vcztools view-bed``; see ``vcztools view-bed --help`` for the
+    full reference.
+
     The mount runs in the foreground until interrupted with Ctrl-C.
     """
-    _setup_logging(verbose)
+    log_config = vcztools_cli.LogConfig.pop_from_click_kwargs(kwargs)
+    reader_options = vcztools_cli.ViewBedOptions.pop_from_click_kwargs(kwargs)
+    assert kwargs == {}, kwargs
+    log_config.apply()
 
     mount_dir_path = pathlib.Path(mount_dir)
     if not mount_dir_path.is_dir():
@@ -118,7 +102,8 @@ def mount_plink(
             vcz_url,
             str(mount_dir_path),
             resolved_basename,
-            backend_storage,
+            reader_options,
+            log_config,
             log_path,
             sock_path,
         )
@@ -128,12 +113,16 @@ async def _amount(
     vcz_url: str,
     mount_dir: str,
     basename: str,
-    backend_storage: str | None,
+    reader_options: vcztools_cli.ViewBedOptions,
+    log_config: vcztools_cli.LogConfig,
     log_path: pathlib.Path | None,
     sock_path: pathlib.Path,
 ) -> None:
     async with await plink_client.PlinkClient.start(
-        vcz_url, sock_path, backend_storage=backend_storage
+        vcz_url,
+        sock_path,
+        reader_options=reader_options,
+        log_config=log_config,
     ) as client:
         with access_log.AccessLogger(log_path) as access_logger:
             ops = plink_ops.PlinkOps(client, basename, access_logger=access_logger)

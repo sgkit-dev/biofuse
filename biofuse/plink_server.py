@@ -213,8 +213,8 @@ def _server_main(
     listener_sock: socket.socket,
     stop_sock: socket.socket,
     vcz_url: str,
-    backend_storage: str | None,
-    log_level: int = logging.WARNING,
+    reader_options: vcztools_cli.ViewBedOptions,
+    log_config: vcztools_cli.LogConfig,
 ) -> None:
     """Subprocess entry point invoked via ``multiprocessing.Process``.
 
@@ -224,22 +224,14 @@ def _server_main(
     (one pool per reader, drawn on by every ``BedEncoder`` /
     ``ReadaheadPipeline``) is drained on the way out.
 
-    ``log_level`` matches the parent's verbosity so the subprocess's
-    own ``logger.debug`` / ``logger.info`` output reaches the same
-    sink as the parent.
+    ``log_config`` matches the parent's verbosity so the subprocess's
+    own ``logger.debug`` / ``logger.info`` output reaches the same sink
+    as the parent. ``reader_options`` carries the bcftools-style
+    filtering options (regions, samples, …) that vcztools'
+    ``make_reader`` consumes.
     """
-    # ``force=True`` so the explicitly-passed ``log_level`` wins even
-    # if some upstream import in this subprocess (or the parent's
-    # logging state, replayed via ``spawn``) has already configured
-    # the root logger. Without it, ``basicConfig`` is a no-op and the
-    # subprocess silently keeps the wrong level.
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
-        datefmt="%H:%M:%S",
-        force=True,
-    )
-    with vcztools_cli.make_reader(vcz_url, backend_storage=backend_storage) as reader:
+    log_config.apply()
+    with vcztools_cli.make_reader_from_options(vcz_url, reader_options) as reader:
         session = _ServerSession(reader)
         try:
             serve_forever(listener_sock, stop_sock, session)

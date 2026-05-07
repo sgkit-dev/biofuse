@@ -17,6 +17,7 @@ import time
 from collections.abc import Callable
 
 import trio
+from vcztools import cli as vcztools_cli
 
 from biofuse import plink_protocol, plink_server
 
@@ -146,8 +147,8 @@ class PlinkClient:
         vcz_url: str,
         socket_path: pathlib.Path,
         *,
-        backend_storage: str | None = None,
-        log_level: int | None = None,
+        reader_options: vcztools_cli.ViewBedOptions | None = None,
+        log_config: vcztools_cli.LogConfig | None = None,
     ) -> "PlinkClient":
         """Spawn the server, run the metadata handshake, return client.
 
@@ -156,11 +157,16 @@ class PlinkClient:
         reduction dups the fds across the spawn boundary; the parent
         closes its own copies once the child has started.
 
-        ``log_level`` is forwarded to the subprocess so its
-        ``logger.debug`` / ``info`` output appears in the parent's
-        log sink. If ``None``, the subprocess uses its default
-        (WARNING).
+        ``reader_options`` carries the bcftools-view-style filtering
+        options forwarded to vcztools' ``make_reader`` in the worker;
+        ``log_config`` configures logging in the worker so its
+        ``logger.debug`` / ``info`` output reaches the parent's sink.
+        Both default to the empty / WARNING configuration.
         """
+        if reader_options is None:
+            reader_options = vcztools_cli.ViewBedOptions()
+        if log_config is None:
+            log_config = vcztools_cli.LogConfig()
         socket_path = pathlib.Path(socket_path)
         socket_path.parent.mkdir(parents=True, exist_ok=True)
         if socket_path.exists():
@@ -170,11 +176,9 @@ class PlinkClient:
         listener.listen(64)
         parent_stop, child_stop = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         ctx = mp.get_context("spawn")
-        if log_level is None:
-            log_level = logging.getLogger().getEffectiveLevel()
         proc: mp.process.BaseProcess = ctx.Process(
             target=plink_server._server_main,
-            args=(listener, child_stop, vcz_url, backend_storage, log_level),
+            args=(listener, child_stop, vcz_url, reader_options, log_config),
             name="biofuse-plink-server",
         )
         try:
