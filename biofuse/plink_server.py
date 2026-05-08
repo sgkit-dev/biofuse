@@ -212,7 +212,7 @@ def _server_main(
     listener_sock: socket.socket,
     stop_sock: socket.socket,
     vcz_url: str,
-    reader_options: vcztools_cli.ViewBedOptions,
+    reader_options: vcztools_cli.ViewPlinkOptions,
     log_config: vcztools_cli.LogConfig,
 ) -> None:
     """Subprocess entry point invoked via ``multiprocessing.Process``.

@@ -364,7 +364,7 @@ class TestServerMainStartupFailure:
                 listener,
                 child_stop,
                 str(fx_multiallelic_vcz.path),
-                vcztools_cli.ViewBedOptions(),
+                vcztools_cli.ViewPlinkOptions(),
                 vcztools_cli.LogConfig(),
             ),
         )
@@ -410,7 +410,7 @@ class TestServerMainSmoke:
                 listener,
                 child_stop,
                 str(fx_small_vcz.path),
-                vcztools_cli.ViewBedOptions(),
+                vcztools_cli.ViewPlinkOptions(),
                 vcztools_cli.LogConfig(),
             ),
         )

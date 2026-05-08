@@ -343,7 +343,7 @@ class TestRealSubprocess:
     async def test_max_alleles_filter_through_start(
         self, fx_multiallelic_vcz, tmp_path
     ):
-        """``ViewBedOptions(max_alleles=2)`` flows through the
+        """``ViewPlinkOptions(max_alleles=2)`` flows through the
         multiprocessing spawn into the worker's ``make_reader_from_options``
         and drops multi-allelic variants, so the handshake succeeds and
         the metadata reflects the filtered variant count."""
@@ -356,7 +356,7 @@ class TestRealSubprocess:
         client = await plink_client.PlinkClient.start(
             str(fx_multiallelic_vcz.path),
             socket_path,
-            reader_options=vcztools_cli.ViewBedOptions(max_alleles=2),
+            reader_options=vcztools_cli.ViewPlinkOptions(max_alleles=2),
         )
         try:
             bim_lines = client.bim_bytes.decode("utf-8").splitlines()

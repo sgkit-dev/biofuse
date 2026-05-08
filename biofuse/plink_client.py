@@ -147,7 +147,7 @@ class PlinkClient:
         vcz_url: str,
         socket_path: pathlib.Path,
         *,
-        reader_options: vcztools_cli.ViewBedOptions | None = None,
+        reader_options: vcztools_cli.ViewPlinkOptions | None = None,
         log_config: vcztools_cli.LogConfig | None = None,
     ) -> "PlinkClient":
         """Spawn the server, run the metadata handshake, return client.
@@ -164,7 +164,7 @@ class PlinkClient:
         Both default to the empty / WARNING configuration.
         """
         if reader_options is None:
-            reader_options = vcztools_cli.ViewBedOptions()
+            reader_options = vcztools_cli.ViewPlinkOptions()
         if log_config is None:
             log_config = vcztools_cli.LogConfig()
         socket_path = pathlib.Path(socket_path)

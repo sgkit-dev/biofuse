@@ -50,8 +50,8 @@ Options:
 - The bcftools-view-style filter / backend / log options
   (`-r`/`-R`/`-s`/`-S`/`-t`/`-T`/`-i`/`-e`/`-v`/`-V`/`-m`/`-M`,
   `--backend-storage`, `--storage-option`, `--log-level`, `--log-file`)
-  are inherited from `vcztools view-bed`. Run `biofuse mount-plink --help`
-  or see `vcztools view-bed --help` for the full reference.
+  are inherited from `vcztools view-plink`. Run `biofuse mount-plink --help`
+  or see `vcztools view-plink --help` for the full reference.
 
 Example:
 
