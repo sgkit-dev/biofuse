@@ -67,7 +67,7 @@ def biofuse_main():
     type=click.Path(file_okay=False, dir_okay=True, path_type=str),
 )
 @basename_opt
-@vcztools_cli.view_bed_options
+@vcztools_cli.view_plink_options
 @access_log_opt
 @vcztools_cli.log_options
 @handle_exception
@@ -80,13 +80,13 @@ def mount_plink(vcz_url, mount_dir, basename, access_log_path, **kwargs):
     process's memory; only ``.bed`` reads cross the wire.
 
     The bcftools-view-style filter / backend / log options are inherited
-    from ``vcztools view-bed``; see ``vcztools view-bed --help`` for the
+    from ``vcztools view-plink``; see ``vcztools view-plink --help`` for the
     full reference.
 
     The mount runs in the foreground until interrupted with Ctrl-C.
     """
     log_config = vcztools_cli.LogConfig.pop_from_click_kwargs(kwargs)
-    reader_options = vcztools_cli.ViewBedOptions.pop_from_click_kwargs(kwargs)
+    reader_options = vcztools_cli.ViewPlinkOptions.pop_from_click_kwargs(kwargs)
     assert kwargs == {}, kwargs
     log_config.apply()
 
@@ -115,7 +115,7 @@ async def _amount(
     vcz_url: str,
     mount_dir: str,
     basename: str,
-    reader_options: vcztools_cli.ViewBedOptions,
+    reader_options: vcztools_cli.ViewPlinkOptions,
     log_config: vcztools_cli.LogConfig,
     log_path: pathlib.Path | None,
     sock_path: pathlib.Path,
