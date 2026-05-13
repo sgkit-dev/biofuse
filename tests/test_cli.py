@@ -17,9 +17,16 @@ class TestHelp:
         result = CliRunner().invoke(cli.biofuse_main, ["--help"])
         assert result.exit_code == 0
         assert "mount-plink" in result.output
+        assert "mount-bgen" in result.output
 
     def test_mount_plink_help(self):
         result = CliRunner().invoke(cli.biofuse_main, ["mount-plink", "--help"])
+        assert result.exit_code == 0
+        assert "VCZ_URL" in result.output
+        assert "MOUNT_DIR" in result.output
+
+    def test_mount_bgen_help(self):
+        result = CliRunner().invoke(cli.biofuse_main, ["mount-bgen", "--help"])
         assert result.exit_code == 0
         assert "VCZ_URL" in result.output
         assert "MOUNT_DIR" in result.output
@@ -42,6 +49,14 @@ class TestArgumentValidation:
         result = CliRunner().invoke(
             cli.biofuse_main,
             ["mount-plink", "x.vcz", str(tmp_path / "missing-mount")],
+        )
+        assert result.exit_code != 0
+        assert "mount directory does not exist" in result.output
+
+    def test_bgen_nonexistent_mount_dir_fails(self, tmp_path):
+        result = CliRunner().invoke(
+            cli.biofuse_main,
+            ["mount-bgen", "x.vcz", str(tmp_path / "missing-mount")],
         )
         assert result.exit_code != 0
         assert "mount directory does not exist" in result.output
@@ -154,6 +169,61 @@ class TestEndToEndMount:
             assert "tsk_0" in fam_text
             assert "tsk_1" in fam_text
             assert "tsk_2" not in fam_text
+        finally:
+            self._terminate(proc, mnt)
+
+    def test_bgen_mounts_and_serves_files(self, tmp_path, fx_small_vcz):
+        mnt = tmp_path / "mnt"
+        mnt.mkdir()
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "biofuse.cli",
+                "mount-bgen",
+                str(fx_small_vcz.path),
+                str(mnt),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            self._wait_for_mount(mnt, proc, timeout=15)
+            names = sorted(p.name for p in mnt.iterdir())
+            assert "small.bgen" in names
+            assert "small.sample" in names
+            assert "small.bgen.bgi" in names
+            assert (mnt / "small.bgen").stat().st_size > 0
+            # Two header rows + one row per sample.
+            sample_lines = (mnt / "small.sample").read_text().splitlines()
+            assert len(sample_lines) == 2 + fx_small_vcz.num_samples
+        finally:
+            self._terminate(proc, mnt)
+
+    def test_bgen_basename_override(self, tmp_path, fx_small_vcz):
+        mnt = tmp_path / "mnt"
+        mnt.mkdir()
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "biofuse.cli",
+                "mount-bgen",
+                str(fx_small_vcz.path),
+                str(mnt),
+                "--basename",
+                "custom",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            self._wait_for_mount(mnt, proc, timeout=15)
+            assert sorted(p.name for p in mnt.iterdir()) == [
+                "custom.bgen",
+                "custom.bgen.bgi",
+                "custom.sample",
+            ]
         finally:
             self._terminate(proc, mnt)
 

@@ -1,4 +1,4 @@
-"""Wire protocol for the plink-server subprocess.
+"""Wire protocol for the encoder-server subprocess.
 
 A minimal request/reply protocol exchanged over a connected
 ``AF_UNIX`` ``SOCK_STREAM`` socket. Each socket carries one
@@ -10,13 +10,13 @@ Two request shapes
 ------------------
 
 ``M`` (1 byte) — get metadata. No payload.
-    Reply body: ``<bim_size:Q><fam_size:Q><bed_size:Q>`` then
-    ``bim_size`` bytes of ``.bim`` then ``fam_size`` bytes of
-    ``.fam``. ``status`` on success is the body length in bytes
-    (``= 24 + bim_size + fam_size``).
+    Reply body: ``<n_static:H><stream_size:Q>`` then
+    ``n_static`` × ``<size:Q>`` then the concatenated static-file
+    bodies in the order declared by the format spec. ``status`` on
+    success is the total body length in bytes.
 
 ``R off:Q size:Q`` (17 bytes) — read ``size`` bytes at ``off`` from
-    the connection's ``.bed`` view. Reply body is the data bytes;
+    the connection's streaming file. Reply body is the data bytes;
     ``status`` is the body length.
 
 Reply layout (common)
@@ -35,11 +35,16 @@ TAG_READ = b"R"
 
 _REQ_READ = struct.Struct("<QQ")
 _REPLY_STATUS = struct.Struct("<q")
-_META_HEADER = struct.Struct("<QQQ")  # bim_size, fam_size, bed_size
+# Variable-arity metadata reply prefix: number of static files plus the
+# streaming-file size. Per-static sizes follow as a packed array of
+# ``<Q>`` entries, then the concatenated static bodies.
+_META_PREFIX = struct.Struct("<HQ")
+_META_SIZE_ENTRY = struct.Struct("<Q")
 
 REPLY_STATUS_SIZE = _REPLY_STATUS.size  # 8
 REQ_READ_PAYLOAD_SIZE = _REQ_READ.size  # 16
-META_HEADER_SIZE = _META_HEADER.size  # 24
+META_PREFIX_SIZE = _META_PREFIX.size  # 10
+META_SIZE_ENTRY_SIZE = _META_SIZE_ENTRY.size  # 8
 
 
 # -- request encoding / decoding ----------------------------------------
@@ -61,12 +66,17 @@ def parse_read_payload(buf: bytes) -> tuple[int, int]:
 # -- reply encoding -----------------------------------------------------
 
 
-def pack_metadata_reply(bim_bytes: bytes, fam_bytes: bytes, bed_size: int) -> bytes:
-    body = (
-        _META_HEADER.pack(len(bim_bytes), len(fam_bytes), bed_size)
-        + bim_bytes
-        + fam_bytes
-    )
+def pack_metadata_reply(static_bodies: list[bytes], stream_size: int) -> bytes:
+    """Pack a variable-arity metadata reply.
+
+    ``static_bodies`` is the per-static-file payload, in the spec's
+    declared order. The reply body is the prefix + per-static sizes +
+    the concatenated bodies; ``status`` is the body length.
+    """
+    n_static = len(static_bodies)
+    prefix = _META_PREFIX.pack(n_static, stream_size)
+    sizes = b"".join(_META_SIZE_ENTRY.pack(len(b)) for b in static_bodies)
+    body = prefix + sizes + b"".join(static_bodies)
     return _REPLY_STATUS.pack(len(body)) + body
 
 
@@ -88,10 +98,17 @@ def parse_status(buf: bytes) -> int:
     return status
 
 
-def parse_metadata_header(buf: bytes) -> tuple[int, int, int]:
-    """Decode the ``<bim_size, fam_size, bed_size>`` header at the
-    front of a metadata reply body."""
-    return _META_HEADER.unpack(buf)
+def parse_metadata_prefix(buf: bytes) -> tuple[int, int]:
+    """Decode the ``<n_static, stream_size>`` prefix of a metadata reply."""
+    return _META_PREFIX.unpack(buf)
+
+
+def parse_static_sizes(buf: bytes, n_static: int) -> tuple[int, ...]:
+    """Decode the per-static-file size array following the prefix."""
+    return tuple(
+        _META_SIZE_ENTRY.unpack_from(buf, offset=i * META_SIZE_ENTRY_SIZE)[0]
+        for i in range(n_static)
+    )
 
 
 # -- shared helpers -----------------------------------------------------
@@ -102,7 +119,7 @@ def status_to_error(status: int) -> OSError:
     if status >= 0:
         raise ValueError(f"status must be negative (got {status})")
     err = -status
-    return OSError(err, f"plink-server reported errno {err}")
+    return OSError(err, f"encoder-server reported errno {err}")
 
 
 def errno_for_exception(exc: BaseException) -> int:

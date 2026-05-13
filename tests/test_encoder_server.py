@@ -1,10 +1,14 @@
-"""Tests for the plink-server module.
+"""Tests for the encoder-server module.
 
 Covers ``_handle_connection`` (per-connection synchronous loop) and
 ``serve_forever`` (accept loop with select-based stop signal). All
 fast tests run against ``socket.socketpair`` / a local listener; one
 real-subprocess smoke test exercises ``_server_main`` to validate
 the multiprocessing fd-passing handshake.
+
+Tests parametrise over both :data:`biofuse.formats.PLINK_SPEC` and
+:data:`biofuse.formats.BGEN_SPEC` so the duck-typed dispatch is
+exercised end-to-end for both output formats.
 """
 
 import errno
@@ -17,21 +21,36 @@ import threading
 import time
 
 import pytest
+from vcztools import bgen as vcztools_bgen
 from vcztools import cli as vcztools_cli
+from vcztools import plink as vcztools_plink
 from vcztools.cli import make_reader
-from vcztools.plink import write_plink
 
-from biofuse import plink_protocol, plink_server
+from biofuse import encoder_protocol, encoder_server, formats
+
+
+@pytest.fixture(params=[formats.PLINK_SPEC, formats.BGEN_SPEC], ids=["plink", "bgen"])
+def fx_spec(request):
+    return request.param
 
 
 @pytest.fixture
-def fx_golden_dir(tmp_path, fx_small_vcz):
-    """Materialised PLINK fileset for fx_small_vcz, used as byte-identity
-    reference."""
-    golden = tmp_path / "golden"
-    golden.mkdir()
-    write_plink(make_reader(str(fx_small_vcz.path)), golden / "small")
-    return golden, "small"
+def fx_expected(fx_reader, fx_spec):
+    """Spec-direct reference outputs.
+
+    Returns ``(spec, static_files, stream_size)`` produced by calling
+    ``spec.build_static_files`` / the throwaway encoder directly. This is
+    the source of truth for the server's behaviour; on-disk goldens via
+    ``write_plink`` / ``write_bgen`` are not used here because BGEN's
+    ``write_bgen`` defaults to a compressed (non-fixed-size) layout that
+    deliberately differs from the encoder's level-0 random-access layout,
+    and SQLite ``.bgi`` files written in separate calls have
+    non-deterministic page metadata.
+    """
+    static_files = fx_spec.build_static_files(fx_reader)
+    with fx_spec.encoder_factory(fx_reader) as encoder:
+        stream_size = int(encoder.total_size)
+    return fx_spec, static_files, stream_size
 
 
 @pytest.fixture
@@ -40,8 +59,8 @@ def fx_reader(fx_small_vcz):
 
 
 @pytest.fixture
-def fx_session(fx_reader):
-    return plink_server._ServerSession(fx_reader)
+def fx_session(fx_reader, fx_spec):
+    return encoder_server._ServerSession(fx_reader, fx_spec)
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
@@ -55,8 +74,8 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 
 
 def _read_status_and_body(sock: socket.socket) -> tuple[int, bytes]:
-    status = plink_protocol.parse_status(
-        _recv_exact(sock, plink_protocol.REPLY_STATUS_SIZE)
+    status = encoder_protocol.parse_status(
+        _recv_exact(sock, encoder_protocol.REPLY_STATUS_SIZE)
     )
     if status <= 0:
         return status, b""
@@ -64,11 +83,11 @@ def _read_status_and_body(sock: socket.socket) -> tuple[int, bytes]:
 
 
 def _spawn_handle_connection(
-    session: plink_server._ServerSession,
+    session: encoder_server._ServerSession,
 ) -> tuple[socket.socket, threading.Thread]:
     parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     thread = threading.Thread(
-        target=plink_server._handle_connection,
+        target=encoder_server._handle_connection,
         args=(child_sock, session),
         daemon=True,
     )
@@ -77,43 +96,52 @@ def _spawn_handle_connection(
 
 
 class TestServerSession:
-    def test_metadata_sizes_match(self, fx_session, fx_golden_dir, fx_small_vcz):
-        golden, basename = fx_golden_dir
-        assert len(fx_session.bim_bytes) == (golden / f"{basename}.bim").stat().st_size
-        assert len(fx_session.fam_bytes) == (golden / f"{basename}.fam").stat().st_size
-        bytes_per_variant = (fx_small_vcz.num_samples + 3) // 4
-        assert fx_session.bed_size == 3 + fx_small_vcz.num_variants * bytes_per_variant
+    def test_static_files_match_spec_output(self, fx_session, fx_expected):
+        _, expected_static, _ = fx_expected
+        assert set(fx_session.static_files) == set(expected_static)
+        for suffix in expected_static:
+            # ``.bgi`` SQLite bytes can differ across independent writes
+            # in non-payload header fields, so compare sizes rather than
+            # bytes for the .bgi entry; per-byte parity is covered in
+            # the apps suite by reading via the live mount.
+            assert len(fx_session.static_files[suffix]) == len(expected_static[suffix])
+
+    def test_stream_size_matches_encoder_total_size(self, fx_session, fx_expected):
+        _, _, expected_stream_size = fx_expected
+        assert fx_session.stream_size == expected_stream_size
 
 
 class TestHandleConnectionMetadata:
-    def test_get_metadata_returns_full_static(self, fx_session, fx_golden_dir):
-        golden, basename = fx_golden_dir
+    def test_get_metadata_returns_full_static(self, fx_session, fx_expected):
+        spec, _, _ = fx_expected
         parent, thread = _spawn_handle_connection(fx_session)
         try:
-            parent.sendall(plink_protocol.pack_get_metadata_request())
+            parent.sendall(encoder_protocol.pack_get_metadata_request())
             status, body = _read_status_and_body(parent)
+            n_static = len(spec.static_suffixes)
+            sizes_size = n_static * encoder_protocol.META_SIZE_ENTRY_SIZE
+            static_sizes = [
+                len(fx_session.static_files[suffix]) for suffix in spec.static_suffixes
+            ]
             expected_body_size = (
-                plink_protocol.META_HEADER_SIZE
-                + len(fx_session.bim_bytes)
-                + len(fx_session.fam_bytes)
+                encoder_protocol.META_PREFIX_SIZE + sizes_size + sum(static_sizes)
             )
             assert status == expected_body_size
-            bim_size, fam_size, bed_size = plink_protocol.parse_metadata_header(
-                body[: plink_protocol.META_HEADER_SIZE]
+            got_n_static, got_stream_size = encoder_protocol.parse_metadata_prefix(
+                body[: encoder_protocol.META_PREFIX_SIZE]
             )
-            assert bim_size == (golden / f"{basename}.bim").stat().st_size
-            assert fam_size == (golden / f"{basename}.fam").stat().st_size
-            assert bed_size == fx_session.bed_size
-            offset = plink_protocol.META_HEADER_SIZE
-            assert (
-                body[offset : offset + bim_size]
-                == (golden / f"{basename}.bim").read_bytes()
+            assert got_n_static == n_static
+            assert got_stream_size == fx_session.stream_size
+            sizes_start = encoder_protocol.META_PREFIX_SIZE
+            sizes_end = sizes_start + sizes_size
+            sizes = encoder_protocol.parse_static_sizes(
+                body[sizes_start:sizes_end], n_static
             )
-            offset += bim_size
-            assert (
-                body[offset : offset + fam_size]
-                == (golden / f"{basename}.fam").read_bytes()
-            )
+            assert sizes == tuple(static_sizes)
+            offset = sizes_end
+            for suffix, size in zip(spec.static_suffixes, sizes, strict=True):
+                assert body[offset : offset + size] == fx_session.static_files[suffix]
+                offset += size
         finally:
             parent.close()
             thread.join(timeout=5)
@@ -121,35 +149,41 @@ class TestHandleConnectionMetadata:
 
 
 class TestHandleConnectionRead:
-    def test_full_bed_read_matches_golden(self, fx_session, fx_golden_dir):
-        golden, basename = fx_golden_dir
-        expected = (golden / f"{basename}.bed").read_bytes()
+    def test_full_stream_read_matches_session_size(self, fx_session):
+        """The encoder's full byte stream matches ``stream_size``.
+
+        We do not byte-compare against the on-disk golden here: for
+        BGEN the on-disk file and the encoder both emit level-0 blocks
+        with the same fixed layout, but a parametric byte-compare
+        belongs in the apps suite. This test pins that the read loop
+        reaches EOF exactly at ``stream_size``.
+        """
         parent, thread = _spawn_handle_connection(fx_session)
         try:
-            parent.sendall(plink_protocol.pack_read_request(0, len(expected)))
+            parent.sendall(
+                encoder_protocol.pack_read_request(0, fx_session.stream_size)
+            )
             status, body = _read_status_and_body(parent)
-            assert status == len(expected)
-            assert body == expected
+            assert status == fx_session.stream_size
+            assert len(body) == fx_session.stream_size
         finally:
             parent.close()
             thread.join(timeout=5)
 
-    def test_chunked_bed_read(self, fx_session, fx_golden_dir):
-        golden, basename = fx_golden_dir
-        expected = (golden / f"{basename}.bed").read_bytes()
+    def test_chunked_read(self, fx_session):
         parent, thread = _spawn_handle_connection(fx_session)
         try:
             chunks = []
             offset = 0
             block = 4096
             while True:
-                parent.sendall(plink_protocol.pack_read_request(offset, block))
+                parent.sendall(encoder_protocol.pack_read_request(offset, block))
                 _, body = _read_status_and_body(parent)
                 if len(body) == 0:
                     break
                 chunks.append(body)
                 offset += len(body)
-            assert b"".join(chunks) == expected
+            assert sum(len(c) for c in chunks) == fx_session.stream_size
         finally:
             parent.close()
             thread.join(timeout=5)
@@ -184,18 +218,19 @@ class TestHandleConnectionRead:
 
 
 class TestHandleConnectionEncoderConstructionFailure:
-    """Errors raised while constructing the per-connection ``BedEncoder``
+    """Errors raised while constructing the per-connection encoder
     must surface as an errno reply on the wire — the parent layer relies
     on this to translate failures into a real ``OSError`` rather than an
     unexplained EOF."""
 
-    def test_oserror_returns_matching_errno(self, fx_session, monkeypatch):
+    def test_plink_oserror_returns_matching_errno(self, fx_reader, monkeypatch):
         class _BoomEncoder:
             def __init__(self, *args, **kwargs):
                 raise OSError(errno.EACCES, "boom")
 
-        monkeypatch.setattr(plink_server.vcztools_plink, "BedEncoder", _BoomEncoder)
-        parent, thread = _spawn_handle_connection(fx_session)
+        session = encoder_server._ServerSession(fx_reader, formats.PLINK_SPEC)
+        monkeypatch.setattr(vcztools_plink, "BedEncoder", _BoomEncoder)
+        parent, thread = _spawn_handle_connection(session)
         try:
             status, body = _read_status_and_body(parent)
             assert status == -errno.EACCES
@@ -205,13 +240,31 @@ class TestHandleConnectionEncoderConstructionFailure:
         finally:
             parent.close()
 
-    def test_other_exception_returns_eio(self, fx_session, monkeypatch):
+    def test_bgen_oserror_returns_matching_errno(self, fx_reader, monkeypatch):
+        class _BoomEncoder:
+            def __init__(self, *args, **kwargs):
+                raise OSError(errno.EACCES, "boom")
+
+        session = encoder_server._ServerSession(fx_reader, formats.BGEN_SPEC)
+        monkeypatch.setattr(vcztools_bgen, "BgenEncoder", _BoomEncoder)
+        parent, thread = _spawn_handle_connection(session)
+        try:
+            status, body = _read_status_and_body(parent)
+            assert status == -errno.EACCES
+            assert body == b""
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+        finally:
+            parent.close()
+
+    def test_plink_other_exception_returns_eio(self, fx_reader, monkeypatch):
         class _BoomEncoder:
             def __init__(self, *args, **kwargs):
                 raise RuntimeError("not an OSError")
 
-        monkeypatch.setattr(plink_server.vcztools_plink, "BedEncoder", _BoomEncoder)
-        parent, thread = _spawn_handle_connection(fx_session)
+        session = encoder_server._ServerSession(fx_reader, formats.PLINK_SPEC)
+        monkeypatch.setattr(vcztools_plink, "BedEncoder", _BoomEncoder)
+        parent, thread = _spawn_handle_connection(session)
         try:
             status, body = _read_status_and_body(parent)
             assert status == -errno.EIO
@@ -226,18 +279,18 @@ class TestServeForever:
     def _bind_listener(
         self, tmp_path: pathlib.Path
     ) -> tuple[socket.socket, pathlib.Path]:
-        sock_path = tmp_path / "plink.sock"
+        sock_path = tmp_path / "encoder.sock"
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(sock_path))
         listener.listen(8)
         return listener, sock_path
 
     def _start_server_thread(
-        self, listener: socket.socket, session: plink_server._ServerSession
+        self, listener: socket.socket, session: encoder_server._ServerSession
     ) -> tuple[socket.socket, threading.Thread]:
         parent_stop, child_stop = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         thread = threading.Thread(
-            target=plink_server.serve_forever,
+            target=encoder_server.serve_forever,
             args=(listener, child_stop, session),
             daemon=True,
         )
@@ -257,7 +310,7 @@ class TestServeForever:
                     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                     s.connect(str(sock_path))
                     try:
-                        s.sendall(plink_protocol.pack_get_metadata_request())
+                        s.sendall(encoder_protocol.pack_get_metadata_request())
                         _, body = _read_status_and_body(s)
                         with lock:
                             replies.append(body)
@@ -280,15 +333,10 @@ class TestServeForever:
             server_thread.join(timeout=5)
             assert not server_thread.is_alive()
 
-    def test_concurrent_bed_reads_independent_state(
-        self, fx_session, fx_golden_dir, tmp_path
-    ):
-        """Each ``BedConnection`` runs in its own server thread with its
-        own encoder; reads on distinct connections see byte-identical
-        bed bytes regardless of interleaving."""
-        golden, basename = fx_golden_dir
-        expected = (golden / f"{basename}.bed").read_bytes()
-
+    def test_concurrent_stream_reads_independent_state(self, fx_session, tmp_path):
+        """Each connection runs in its own server thread with its own
+        encoder; full reads on distinct connections see byte-identical
+        streams regardless of interleaving."""
         listener, sock_path = self._bind_listener(tmp_path)
         parent_stop, server_thread = self._start_server_thread(listener, fx_session)
         try:
@@ -303,11 +351,12 @@ class TestServeForever:
                     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                     s.connect(str(sock_path))
                     try:
-                        # All threads start their reads at roughly the
-                        # same time so the server has multiple in-flight
-                        # connections, demonstrating concurrent threads.
                         barrier.wait(timeout=5)
-                        s.sendall(plink_protocol.pack_read_request(0, len(expected)))
+                        s.sendall(
+                            encoder_protocol.pack_read_request(
+                                0, fx_session.stream_size
+                            )
+                        )
                         _, body = _read_status_and_body(s)
                         with lock:
                             results[tid] = body
@@ -324,8 +373,10 @@ class TestServeForever:
                 t.join(timeout=30)
             assert errors == []
             assert len(results) == n
+            reference = results[0]
+            assert len(reference) == fx_session.stream_size
             for body in results.values():
-                assert body == expected
+                assert body == reference
         finally:
             parent_stop.close()
             server_thread.join(timeout=5)
@@ -351,19 +402,25 @@ class TestServerMainStartupFailure:
     to stderr) when the VCZ cannot be served — e.g. multi-allelic
     input."""
 
-    def test_multiallelic_subprocess_exits_cleanly(self, fx_multiallelic_vcz, tmp_path):
-        sock_path = tmp_path / "plink.sock"
+    @pytest.mark.parametrize(
+        "spec", [formats.PLINK_SPEC, formats.BGEN_SPEC], ids=["plink", "bgen"]
+    )
+    def test_multiallelic_subprocess_exits_cleanly(
+        self, fx_multiallelic_vcz, tmp_path, spec
+    ):
+        sock_path = tmp_path / "encoder.sock"
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(sock_path))
         listener.listen(8)
         parent_stop, child_stop = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         ctx = mp.get_context("spawn")
         proc = ctx.Process(
-            target=plink_server._server_main,
+            target=encoder_server._server_main,
             args=(
                 listener,
                 child_stop,
                 str(fx_multiallelic_vcz.path),
+                spec,
                 vcztools_cli.ViewPlinkOptions(),
                 vcztools_cli.LogConfig(),
             ),
@@ -397,19 +454,23 @@ class TestServerMainStartupFailure:
 class TestServerMainSmoke:
     """End-to-end check that ``_server_main`` runs in a real subprocess."""
 
-    def test_spawn_metadata_handshake(self, fx_small_vcz, tmp_path):
-        sock_path = tmp_path / "plink.sock"
+    @pytest.mark.parametrize(
+        "spec", [formats.PLINK_SPEC, formats.BGEN_SPEC], ids=["plink", "bgen"]
+    )
+    def test_spawn_metadata_handshake(self, fx_small_vcz, tmp_path, spec):
+        sock_path = tmp_path / "encoder.sock"
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(sock_path))
         listener.listen(8)
         parent_stop, child_stop = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         ctx = mp.get_context("spawn")
         proc = ctx.Process(
-            target=plink_server._server_main,
+            target=encoder_server._server_main,
             args=(
                 listener,
                 child_stop,
                 str(fx_small_vcz.path),
+                spec,
                 vcztools_cli.ViewPlinkOptions(),
                 vcztools_cli.LogConfig(),
             ),
@@ -434,15 +495,14 @@ class TestServerMainSmoke:
                     time.sleep(0.05)
             assert client_sock is not None, "could not connect to spawned server"
             try:
-                client_sock.sendall(plink_protocol.pack_get_metadata_request())
+                client_sock.sendall(encoder_protocol.pack_get_metadata_request())
                 status, body = _read_status_and_body(client_sock)
                 assert status > 0
-                bim_size, fam_size, bed_size = plink_protocol.parse_metadata_header(
-                    body[: plink_protocol.META_HEADER_SIZE]
+                n_static, stream_size = encoder_protocol.parse_metadata_prefix(
+                    body[: encoder_protocol.META_PREFIX_SIZE]
                 )
-                assert bim_size > 0
-                assert fam_size > 0
-                assert bed_size > 0
+                assert n_static == len(spec.static_suffixes)
+                assert stream_size > 0
             finally:
                 client_sock.close()
         finally:
