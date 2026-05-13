@@ -2,8 +2,9 @@
 
 Mirrors :mod:`test_plink_apps`: mount a VCZ as a BGEN fileset via the
 real encoder-server subprocess, then read the mounted files. Where
-external binaries (``bgenix``, ``qctool``) are on PATH, the relevant
-test classes also exercise the mount through those tools.
+``plink2`` is on PATH, ``TestPlinkTwo`` also exercises the mount as a
+BGEN reader and compares its output to a side-by-side copy of the
+encoder's bytes.
 """
 
 import os
@@ -18,11 +19,9 @@ from vcztools.cli import make_reader
 
 from biofuse import access_log, encoder_client, encoder_ops, formats, fuse_adapter
 
-BGENIX = shutil.which("bgenix")
-QCTOOL = shutil.which("qctool")
+PLINK2 = shutil.which("plink2")
 
-needs_bgenix = pytest.mark.skipif(BGENIX is None, reason="bgenix not installed")
-needs_qctool = pytest.mark.skipif(QCTOOL is None, reason="qctool not installed")
+needs_plink2 = pytest.mark.skipif(PLINK2 is None, reason="plink2 not installed")
 
 
 async def _wait_for_mount(mnt: pathlib.Path, timeout: float = 5.0) -> None:
@@ -139,76 +138,57 @@ def _pread_sync(path: pathlib.Path, off: int, size: int) -> bytes:
         return f.read(size)
 
 
-@needs_bgenix
-class TestBgenix:
-    async def test_bgenix_lists_variants(
-        self, fx_mounted_bgen, fx_medium_vcz, tmp_path
-    ):
-        mnt, basename, _, _ = fx_mounted_bgen
-        # ``bgenix -g X -list`` writes a per-variant table to stdout.
-        result = await trio.run_process(
-            [BGENIX, "-g", str(mnt / f"{basename}.bgen"), "-list"],
-            capture_stdout=True,
-            capture_stderr=True,
-            check=True,
-        )
-        stdout_text = result.stdout.decode()
-        # Each variant produces one row; sum of data rows must match
-        # the variant count (header / trailer lines start with '#').
-        data_rows = [
-            ln
-            for ln in stdout_text.splitlines()
-            if ln and not ln.startswith("#") and not ln.startswith("alternate_ids")
-        ]
-        assert len(data_rows) == fx_medium_vcz.num_variants
-
-
-@needs_qctool
-class TestQctool:
-    async def test_qctool_snp_stats_match_encoder_bytes(
-        self, fx_mounted_bgen, tmp_path
-    ):
-        """``qctool -snp-stats`` on the mount equals the same call against
-        a side-by-side copy of the encoder's bytes (written to a plain
-        file). Pins that the mount is byte-equivalent for qctool's
-        consumption."""
+@needs_plink2
+class TestPlinkTwo:
+    async def test_freq_matches_plain_bgen(self, fx_mounted_bgen, tmp_path):
+        """``plink2 --bgen`` on the mount must produce the same ``.afreq``
+        as the same invocation against a side-by-side copy of the
+        encoder's bytes. Pins that the mounted ``.bgen`` is a valid BGEN
+        reader input and that random-access reads (plink2 scans the
+        file) deliver identical bytes to a plain on-disk file."""
         mnt, basename, expected, _ = fx_mounted_bgen
         plain = tmp_path / "plain.bgen"
         plain.write_bytes(expected)
-        # The biofuse mount needs the .sample to be co-located for
-        # qctool to associate samples with the BGEN; copy ours over.
+        # plink2 --bgen needs a matching .sample alongside the .bgen.
         await trio.to_thread.run_sync(
             shutil.copyfile,
             mnt / f"{basename}.sample",
             tmp_path / "plain.sample",
         )
-        out_mnt = tmp_path / "snp_mnt"
-        out_plain = tmp_path / "snp_plain"
+        out_mnt = tmp_path / "p2_freq_mnt"
+        out_plain = tmp_path / "p2_freq_plain"
+        # ``ref-first``: vcztools emits BGEN with allele 0 = REF
+        # (matching the VCZ ``variant_allele`` order).
         await _arun(
             [
-                QCTOOL,
-                "-g",
+                PLINK2,
+                "--bgen",
                 str(mnt / f"{basename}.bgen"),
-                "-s",
+                "ref-first",
+                "--sample",
                 str(mnt / f"{basename}.sample"),
-                "-snp-stats",
-                "-osnp",
+                "--freq",
+                "--out",
                 str(out_mnt),
             ]
         )
         await _arun(
             [
-                QCTOOL,
-                "-g",
+                PLINK2,
+                "--bgen",
                 str(plain),
-                "-s",
+                "ref-first",
+                "--sample",
                 str(tmp_path / "plain.sample"),
-                "-snp-stats",
-                "-osnp",
+                "--freq",
+                "--out",
                 str(out_plain),
             ]
         )
-        assert out_mnt.read_bytes() == out_plain.read_bytes()
+        assert (
+            out_mnt.with_suffix(".afreq").read_bytes()
+            == out_plain.with_suffix(".afreq").read_bytes()
+        )
 
 
 class TestStatfs:
