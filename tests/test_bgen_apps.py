@@ -99,18 +99,8 @@ class TestBgenBytes:
 
     async def test_bgi_parses_as_sqlite(self, fx_mounted_bgen, fx_medium_vcz):
         mnt, basename, _, _ = fx_mounted_bgen
-        bgi_bytes = await trio.to_thread.run_sync(
-            (mnt / f"{basename}.bgen.bgi").read_bytes
-        )
-        # ``sqlite3.connect`` needs a filesystem path, so spill the
-        # bytes to a tmp file in the test scope.
-        bgi_path = mnt.parent / f"{basename}.bgen.bgi.copy"
-        bgi_path.write_bytes(bgi_bytes)
-        conn = sqlite3.connect(str(bgi_path))
-        try:
-            count = conn.execute("SELECT COUNT(*) FROM Variant").fetchone()[0]
-        finally:
-            conn.close()
+        bgi_path = mnt / f"{basename}.bgen.bgi"
+        count = await trio.to_thread.run_sync(_bgi_variant_count, bgi_path)
         assert count == fx_medium_vcz.num_variants
 
 
@@ -136,6 +126,16 @@ def _pread_sync(path: pathlib.Path, off: int, size: int) -> bytes:
     with path.open("rb") as f:
         f.seek(off)
         return f.read(size)
+
+
+def _bgi_variant_count(bgi_path: pathlib.Path) -> int:
+    # ``mode=ro`` keeps sqlite from creating a -journal sidecar; biofuse
+    # mounts are read-only so any write attempt would surface as EROFS.
+    conn = sqlite3.connect(f"file:{bgi_path}?mode=ro", uri=True)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM Variant").fetchone()[0]
+    finally:
+        conn.close()
 
 
 @needs_plink2
