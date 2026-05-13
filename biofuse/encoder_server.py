@@ -28,7 +28,6 @@ import threading
 import time
 
 from vcztools import cli as vcztools_cli
-from vcztools import retrieval as vcztools_retrieval
 
 from biofuse import encoder_protocol, formats
 
@@ -46,7 +45,7 @@ class _ServerSession:
 
     def __init__(
         self,
-        reader: vcztools_retrieval.VczReader,
+        reader,
         spec: formats.FormatSpec,
     ) -> None:
         self.reader = reader

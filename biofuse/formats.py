@@ -26,17 +26,13 @@ but non-trivial, and is a candidate to swap for an mmap'd server-side
 tempdir in a later phase.
 """
 
-import contextlib
 import dataclasses
-import os
 import pathlib
 import tempfile
 from collections.abc import Callable
 
 from vcztools import bgen as vcztools_bgen
-from vcztools import format_encoder as vcztools_format_encoder
 from vcztools import plink as vcztools_plink
-from vcztools import retrieval as vcztools_retrieval
 
 
 @dataclasses.dataclass(frozen=True)
@@ -59,57 +55,44 @@ class FormatSpec:
     :meth:`build_static_files` must return a dict whose keys equal
     this tuple."""
 
-    build_static_files: Callable[[vcztools_retrieval.VczReader], dict[str, bytes]]
+    build_static_files: Callable
     """Build the static sidecars for ``reader``.
 
     Returns a dict ``{suffix: bytes}`` whose keys equal
     :attr:`static_suffixes`."""
 
-    encoder_factory: Callable[
-        [vcztools_retrieval.VczReader],
-        contextlib.AbstractContextManager[vcztools_format_encoder.FormatEncoder],
-    ]
+    encoder_factory: Callable
     """Construct one fresh encoder for one server connection."""
 
 
-def _build_plink_static(reader: vcztools_retrieval.VczReader) -> dict[str, bytes]:
+def _build_plink_static(reader) -> dict[str, bytes]:
     return {
         ".bim": vcztools_plink.generate_bim(reader).encode("utf-8"),
         ".fam": vcztools_plink.generate_fam(reader).encode("utf-8"),
     }
 
 
-def _build_bgen_static(reader: vcztools_retrieval.VczReader) -> dict[str, bytes]:
+def _build_bgen_static(reader) -> dict[str, bytes]:
     sample = vcztools_bgen.generate_sample(reader).encode("utf-8")
     # ``write_bgen_index`` takes a filesystem path. Materialise the .bgi
-    # to a tempfile, read the bytes back, then unlink. The encoder used
-    # to harvest ``variant_offsets`` is I/O-free in ``__init__`` and is
-    # discarded once the offsets are read.
+    # into a TemporaryDirectory, read the bytes back, then let the
+    # context manager clean up. The encoder used to harvest
+    # ``variant_offsets`` is I/O-free in ``__init__`` and is discarded
+    # once the offsets are read.
     with vcztools_bgen.BgenEncoder(reader) as encoder:
         variant_offsets = encoder.variant_offsets
-    fd, tmp_path_str = tempfile.mkstemp(suffix=".bgi", prefix="biofuse-bgen-")
-    os.close(fd)
-    tmp_path = pathlib.Path(tmp_path_str)
-    try:
-        vcztools_bgen.write_bgen_index(reader, str(tmp_path), variant_offsets)
-        bgi = tmp_path.read_bytes()
-    finally:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
+    with tempfile.TemporaryDirectory(prefix="biofuse-bgen-") as tmp_dir:
+        bgi_path = pathlib.Path(tmp_dir) / "index.bgen.bgi"
+        vcztools_bgen.write_bgen_index(reader, str(bgi_path), variant_offsets)
+        bgi = bgi_path.read_bytes()
     return {".sample": sample, ".bgen.bgi": bgi}
 
 
-def _plink_encoder_factory(
-    reader: vcztools_retrieval.VczReader,
-) -> contextlib.AbstractContextManager[vcztools_format_encoder.FormatEncoder]:
+def _plink_encoder_factory(reader):
     return vcztools_plink.BedEncoder(reader)
 
 
-def _bgen_encoder_factory(
-    reader: vcztools_retrieval.VczReader,
-) -> contextlib.AbstractContextManager[vcztools_format_encoder.FormatEncoder]:
+def _bgen_encoder_factory(reader):
     return vcztools_bgen.BgenEncoder(reader)
 
 
