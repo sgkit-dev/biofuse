@@ -1,19 +1,25 @@
 # biofuse
 
 Read-only views of VCF Zarr (VCZ) data in standard bioinformatics file formats
-via a FUSE filesystem. The first supported view is **PLINK 1.9 binary**
-(`.bed` / `.bim` / `.fam`).
+via a FUSE filesystem. Currently supported views:
+
+- **PLINK 1.9 binary** (`.bed` / `.bim` / `.fam`) — via `mount-plink`.
+- **Oxford BGEN** (`.bgen` / `.sample` / `.bgen.bgi`) — via `mount-bgen`.
 
 ## Status
 
-Pre-release. The mount serves `.bed` on demand via a worker subprocess
-running [`vcztools.BedEncoder`](https://github.com/sgkit-dev/vcztools);
-`.bim` and `.fam` are computed once at mount time and held in the
-worker's memory.
+Pre-release. The mount serves the streaming file (`.bed` / `.bgen`) on
+demand via a worker subprocess running the matching
+[`vcztools`](https://github.com/sgkit-dev/vcztools) encoder
+(`BedEncoder` / `BgenEncoder`); the static sidecars are computed once
+at mount time and held in the worker's memory.
 
-The mounted view is read-only and supports the access patterns of `plink1.9`
-and `plink2` for typical analysis commands (`--freq`, `--missing`, `--hardy`,
-etc.) — see `tests/test_plink_apps.py` for the verified set.
+The mounted PLINK view supports the access patterns of `plink1.9` and
+`plink2` for typical analysis commands (`--freq`, `--missing`,
+`--hardy`, etc.) — see `tests/test_plink_apps.py` for the verified set.
+The mounted BGEN view always uses zlib level 0 (stored, fixed-size
+blocks) for O(1) random access; `bgenix` / `qctool` parity checks live
+in `tests/test_bgen_apps.py`.
 
 ## Install
 
@@ -33,6 +39,8 @@ vcztools is currently consumed as a sibling-directory path dependency
 (`../vcztools`); see `pyproject.toml`.
 
 ## Usage
+
+### `mount-plink`
 
 ```bash
 biofuse mount-plink path/to/sample.vcz /mount/dir
@@ -62,18 +70,43 @@ plink1.9 --bfile /tmp/plink-mnt/sample --freq --out ./out
 fusermount3 -u /tmp/plink-mnt
 ```
 
+### `mount-bgen`
+
+```bash
+biofuse mount-bgen path/to/sample.vcz /mount/dir
+```
+
+Mounts a read-only directory at `/mount/dir` containing
+`sample.bgen`, `sample.sample`, `sample.bgen.bgi`. The `.bgen` payload
+uses zlib level 0 (stored, fixed-size variant blocks) so byte-range
+random access is O(1); downstream tools (bgenix, qctool, REGENIE,
+SAIGE, BOLT-LMM, plink2 `--bgen`) consume the mount unchanged. The
+`.bgen.bgi` SQLite sidecar is generated once at mount time and held in
+the worker's memory alongside `.sample`.
+
+Options mirror `mount-plink`: `--basename`, `--access-log`, and the
+shared bcftools-style filter / backend / log set inherited from
+`vcztools view-bgen`. Run `biofuse mount-bgen --help` or see
+`vcztools view-bgen --help` for the full reference.
+
+Example:
+
+```bash
+mkdir /tmp/bgen-mnt
+biofuse mount-bgen ./sample.vcz /tmp/bgen-mnt &
+bgenix -g /tmp/bgen-mnt/sample.bgen -list
+fusermount3 -u /tmp/bgen-mnt
+```
+
 ## Development
 
 ```bash
 uv sync --group dev
-uv run pytest             # full suite
-uv run pytest tests/test_bed_worker.py  # one module
-uv run prek install       # install git pre-commit hook (one-off)
+uv run pytest                          # full suite
+uv run pytest tests/test_encoder_ops.py  # one module
+uv run prek install                    # install git pre-commit hook (one-off)
 uv run --only-group=lint prek -c prek.toml run --all-files
 ```
-
-The streaming source spec lives at
-[`specs/vcztools_streaming_plink.md`](specs/vcztools_streaming_plink.md).
 
 ## Licence
 

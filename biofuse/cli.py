@@ -11,7 +11,7 @@ import click
 import trio
 from vcztools import cli as vcztools_cli
 
-from biofuse import access_log, fuse_adapter, plink_client, plink_ops
+from biofuse import access_log, encoder_client, encoder_ops, formats, fuse_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ def handle_exception(func):
 
 
 def _default_basename(vcz_url: str) -> str:
-    """Strip every suffix off ``vcz_url`` to get a plink fileset stem."""
+    """Strip every suffix off ``vcz_url`` to get a fileset stem."""
     name = pathlib.Path(vcz_url).name
     while True:
         stem = pathlib.Path(name).stem
@@ -46,12 +46,15 @@ access_log_opt = click.option(
     default=None,
     help="Write per-read access trace as JSONL to PATH.",
 )
-basename_opt = click.option(
-    "--basename",
-    type=str,
-    default=None,
-    help="Basename for the plink fileset (defaults to the VCZ stem).",
-)
+
+
+def _basename_opt(format_label: str) -> click.Option:
+    return click.option(
+        "--basename",
+        type=str,
+        default=None,
+        help=f"Basename for the {format_label} fileset (defaults to the VCZ stem).",
+    )
 
 
 @click.group()
@@ -66,7 +69,7 @@ def biofuse_main():
     "mount_dir",
     type=click.Path(file_okay=False, dir_okay=True, path_type=str),
 )
-@basename_opt
+@_basename_opt("plink")
 @vcztools_cli.view_plink_options
 @access_log_opt
 @vcztools_cli.log_options
@@ -85,9 +88,52 @@ def mount_plink(vcz_url, mount_dir, basename, access_log_path, **kwargs):
 
     The mount runs in the foreground until interrupted with Ctrl-C.
     """
-    log_config = vcztools_cli.LogConfig.pop_from_click_kwargs(kwargs)
-    reader_options = vcztools_cli.ViewPlinkOptions.pop_from_click_kwargs(kwargs)
-    assert kwargs == {}, kwargs
+    _run_mount(
+        formats.PLINK_SPEC, vcz_url, mount_dir, basename, access_log_path, kwargs
+    )
+
+
+@biofuse_main.command(name="mount-bgen")
+@click.argument("vcz_url", type=str)
+@click.argument(
+    "mount_dir",
+    type=click.Path(file_okay=False, dir_okay=True, path_type=str),
+)
+@_basename_opt("bgen")
+@vcztools_cli.view_plink_options
+@access_log_opt
+@vcztools_cli.log_options
+@handle_exception
+def mount_bgen(vcz_url, mount_dir, basename, access_log_path, **kwargs):
+    """Mount an Oxford BGEN view of VCZ_URL at MOUNT_DIR.
+
+    Spawns a bgen-server subprocess that owns the ``VczReader`` and
+    serves ``.bgen`` reads over an ``AF_UNIX`` socket. ``.sample`` and
+    ``.bgen.bgi`` are precomputed once at mount time and held in the
+    FUSE process's memory; only ``.bgen`` reads cross the wire.
+
+    The bcftools-view-style filter / backend / log options are inherited
+    from ``vcztools view-bgen``; see ``vcztools view-bgen --help`` for the
+    full reference. The encoder always uses zlib level 0 (stored,
+    fixed-size blocks) so byte-range random access into the mounted
+    ``.bgen`` is O(1).
+
+    The mount runs in the foreground until interrupted with Ctrl-C.
+    """
+    _run_mount(formats.BGEN_SPEC, vcz_url, mount_dir, basename, access_log_path, kwargs)
+
+
+def _run_mount(
+    spec: formats.FormatSpec,
+    vcz_url: str,
+    mount_dir: str,
+    basename: str | None,
+    access_log_path: str | None,
+    extra_kwargs: dict,
+) -> None:
+    log_config = vcztools_cli.LogConfig.pop_from_click_kwargs(extra_kwargs)
+    reader_options = vcztools_cli.ViewPlinkOptions.pop_from_click_kwargs(extra_kwargs)
+    assert extra_kwargs == {}, extra_kwargs
     log_config.apply()
 
     mount_dir_path = pathlib.Path(mount_dir)
@@ -98,9 +144,10 @@ def mount_plink(vcz_url, mount_dir, basename, access_log_path, **kwargs):
     resolved_basename = basename if basename is not None else _default_basename(vcz_url)
 
     with tempfile.TemporaryDirectory(prefix="biofuse-") as sock_dir:
-        sock_path = pathlib.Path(sock_dir) / "plink.sock"
+        sock_path = pathlib.Path(sock_dir) / f"{spec.name}.sock"
         trio.run(
             _amount,
+            spec,
             vcz_url,
             str(mount_dir_path),
             resolved_basename,
@@ -112,6 +159,7 @@ def mount_plink(vcz_url, mount_dir, basename, access_log_path, **kwargs):
 
 
 async def _amount(
+    spec: formats.FormatSpec,
     vcz_url: str,
     mount_dir: str,
     basename: str,
@@ -120,14 +168,17 @@ async def _amount(
     log_path: pathlib.Path | None,
     sock_path: pathlib.Path,
 ) -> None:
-    async with await plink_client.PlinkClient.start(
+    async with await encoder_client.EncoderClient.start(
         vcz_url,
         sock_path,
+        spec,
         reader_options=reader_options,
         log_config=log_config,
     ) as client:
         with access_log.AccessLogger(log_path) as access_logger:
-            ops = plink_ops.PlinkOps(client, basename, access_logger=access_logger)
+            ops = encoder_ops.EncoderOps(
+                client, basename, spec, access_logger=access_logger
+            )
             async with fuse_adapter.mount(ops, mount_dir):
                 click.echo(f"mounted at {mount_dir}", err=True)
                 await _wait_for_signal()

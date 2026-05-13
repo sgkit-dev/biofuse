@@ -1,16 +1,25 @@
-"""pyfuse3.Operations for a PLINK 1.9 view of a VCZ store.
+"""pyfuse3.Operations for an encoder-served view of a VCZ store.
 
-The static ``.bim`` and ``.fam`` bytes are fetched once at mount time
-and held in memory by the FUSE adapter; reads against them are served
-directly from the cached bytes without crossing process boundaries.
+Generic over the output format (PLINK 1.9 / Oxford BGEN). The active
+:class:`~biofuse.formats.FormatSpec` defines:
 
-Each ``.bed`` ``open()`` from the kernel allocates a fresh
-:class:`biofuse.plink_client.BedConnection` — a dedicated socket to
-the plink-server subprocess, where one server thread with one
-``BedEncoder`` runs synchronously for the lifetime of the connection.
+- the streaming file suffix (``.bed`` / ``.bgen``) and its
+  ``streaming_kind`` dispatch key;
+- the static-sidecar suffixes (``.bim``/``.fam`` for PLINK,
+  ``.sample``/``.bgen.bgi`` for BGEN), served from cached bytes the
+  client fetched once at mount time.
+
+The static-sidecar bytes are fetched once at mount time and held in
+memory by the FUSE adapter; reads against them are served directly
+from the cached bytes without crossing process boundaries.
+
+Each streaming-file ``open()`` from the kernel allocates a fresh
+:class:`biofuse.encoder_client.StreamConnection` — a dedicated socket
+to the encoder-server subprocess, where one server thread with one
+encoder runs synchronously for the lifetime of the connection.
 ``read()`` on that fh forwards straight to the per-fh socket; the
 kernel's parallel readahead requests on a single fh serialise on the
-``BedConnection``'s internal lock. ``release()`` closes the socket;
+``StreamConnection``'s internal lock. ``release()`` closes the socket;
 the server thread sees EOF and exits.
 """
 
@@ -25,57 +34,65 @@ import pyfuse3
 import trio
 
 from biofuse import access_log as access_log_mod
+from biofuse import formats
 
 logger = logging.getLogger(__name__)
 
 
 _FILE_MODE = stat.S_IFREG | 0o444
-_DEFAULT_MAX_OPEN_BED = 16
+_DEFAULT_MAX_OPEN_STREAM = 16
 
-# Maximum time a FUSE_OPEN may wait at the per-mount ``.bed`` capacity
-# limiter. On expiry the open returns ``EAGAIN`` to the kernel rather
-# than blocking forever — this guards against a leaked limiter slot
-# permanently wedging open().
+# Maximum time a FUSE_OPEN may wait at the per-mount streaming-file
+# capacity limiter. On expiry the open returns ``EAGAIN`` to the kernel
+# rather than blocking forever — this guards against a leaked limiter
+# slot permanently wedging open().
 _LIMITER_TIMEOUT_S = 30.0
 
+_STATIC_KIND = "static"
 
-class _BedConnectionProto(Protocol):
+
+class _StreamConnectionProto(Protocol):
     async def read(self, off: int, size: int) -> bytes: ...
     async def aclose(self) -> None: ...
 
 
-class PlinkClientProto(Protocol):
-    """The slice of :class:`biofuse.plink_client.PlinkClient` that
-    :class:`PlinkOps` depends on.
+class EncoderClientProto(Protocol):
+    """The slice of :class:`biofuse.encoder_client.EncoderClient` that
+    :class:`EncoderOps` depends on.
 
     Defined as a Protocol so tests can inject a fake without spawning
     a subprocess.
     """
 
-    bim_bytes: bytes
-    fam_bytes: bytes
-    bed_size: int
+    static_bytes: list[bytes]
+    stream_size: int
+    static_suffixes: tuple[str, ...]
 
-    async def open_bed(self) -> _BedConnectionProto: ...
+    async def open_stream(self) -> _StreamConnectionProto: ...
 
 
-class PlinkOps(pyfuse3.Operations):
-    """A pyfuse3 Operations subclass that serves a PLINK 1.9 view of a VCZ.
+class EncoderOps(pyfuse3.Operations):
+    """A pyfuse3 Operations subclass that serves an encoder-rendered view of a VCZ.
 
     Parameters
     ----------
     client
-        A :class:`PlinkClient` already past its metadata handshake (or
-        any object satisfying :class:`PlinkClientProto`). The caller
-        owns the client's lifetime.
+        An :class:`EncoderClient` already past its metadata handshake
+        (or any object satisfying :class:`EncoderClientProto`). The
+        caller owns the client's lifetime.
     basename
-        Stem used for the three exposed files: ``{basename}.bed``,
-        ``{basename}.bim``, ``{basename}.fam``.
-    max_open_bed
-        Maximum number of concurrent open ``.bed`` files. New ``.bed``
-        opens block until a peer release frees a slot. ``.bim``/``.fam``
-        opens are unaffected — they're served from cached static bytes
-        and carry no per-fh state worth queueing.
+        Stem used for the exposed files: ``{basename}{spec.streaming_suffix}``
+        plus one ``{basename}{suffix}`` per ``spec.static_suffixes`` entry.
+    spec
+        The active :class:`~biofuse.formats.FormatSpec`. Its
+        ``streaming_suffix`` / ``static_suffixes`` drive the inode
+        table; its ``streaming_kind`` is the dispatch key for read
+        routing.
+    max_open_stream
+        Maximum number of concurrent open streaming-file fhs. New
+        opens block until a peer release frees a slot. Static-file
+        opens are unaffected — they're served from cached bytes and
+        carry no per-fh state worth queueing.
     access_logger
         Optional ``AccessLogger`` to record per-FUSE-read traces.
     """
@@ -85,35 +102,44 @@ class PlinkOps(pyfuse3.Operations):
 
     def __init__(
         self,
-        client: PlinkClientProto,
+        client: EncoderClientProto,
         basename: str,
+        spec: formats.FormatSpec,
         *,
-        max_open_bed: int = _DEFAULT_MAX_OPEN_BED,
+        max_open_stream: int = _DEFAULT_MAX_OPEN_STREAM,
         access_logger: access_log_mod.AccessLogger | None = None,
     ) -> None:
         super().__init__()
         self._client = client
         self._basename = basename
+        self._spec = spec
         self._access_logger = access_logger
         self._uid = os.getuid()
         self._gid = os.getgid()
-        self._bed_limiter = trio.CapacityLimiter(max_open_bed)
+        self._stream_limiter = trio.CapacityLimiter(max_open_stream)
 
-        bed_name = f"{basename}.bed"
-        bim_name = f"{basename}.bim"
-        fam_name = f"{basename}.fam"
-        files = sorted(
-            [
-                (bed_name, "bed", client.bed_size),
-                (bim_name, "bim", len(client.bim_bytes)),
-                (fam_name, "fam", len(client.fam_bytes)),
-            ]
-        )
+        # Build the file manifest: one streaming file plus one entry per
+        # static suffix. Each entry has a kind that drives read dispatch:
+        # the streaming file's kind is the spec's ``streaming_kind``;
+        # all static files share the same ``_STATIC_KIND`` dispatch key.
+        # ``_name_to_static_index`` maps each static filename to its
+        # index in ``client.static_bytes``.
+        stream_name = f"{basename}{spec.streaming_suffix}"
+        manifest: list[tuple[str, str, int]] = [
+            (stream_name, spec.streaming_kind, client.stream_size)
+        ]
+        self._name_to_static_index: dict[str, int] = {}
+        for index, suffix in enumerate(spec.static_suffixes):
+            name = f"{basename}{suffix}"
+            manifest.append((name, _STATIC_KIND, len(client.static_bytes[index])))
+            self._name_to_static_index[name] = index
+        manifest.sort()
+
         self._inode_to_name: dict[int, str] = {}
         self._name_to_inode: dict[str, int] = {}
         self._inode_to_size: dict[int, int] = {}
         self._name_to_kind: dict[str, str] = {}
-        for index, (name, kind, size) in enumerate(files):
+        for index, (name, kind, size) in enumerate(manifest):
             inode = pyfuse3.ROOT_INODE + 1 + index
             self._inode_to_name[inode] = name
             self._name_to_inode[name] = inode
@@ -123,7 +149,7 @@ class PlinkOps(pyfuse3.Operations):
         self._next_fh = 1
         self._fh_to_kind: dict[int, str] = {}
         self._fh_to_name: dict[int, str] = {}
-        self._fh_to_conn: dict[int, _BedConnectionProto] = {}
+        self._fh_to_conn: dict[int, _StreamConnectionProto] = {}
 
     def _build_attrs(self, inode: int) -> pyfuse3.EntryAttributes:
         attrs = pyfuse3.EntryAttributes()
@@ -187,26 +213,26 @@ class PlinkOps(pyfuse3.Operations):
         fh = self._next_fh
         self._next_fh += 1
         t_open_start = time.monotonic()
-        if kind == "bed":
+        if kind == self._spec.streaming_kind:
             # Use the fh itself as the limiter borrower: each open is a
             # distinct logical owner, even when several share the same
-            # trio task (true under direct PlinkOps tests, and cheap
+            # trio task (true under direct EncoderOps tests, and cheap
             # under pyfuse3 where each request is its own task).
             t_limiter_start = time.monotonic()
             with trio.move_on_after(_LIMITER_TIMEOUT_S) as cs:
-                await self._bed_limiter.acquire_on_behalf_of(fh)
+                await self._stream_limiter.acquire_on_behalf_of(fh)
             t_limiter_end = time.monotonic()
             if cs.cancelled_caught:
                 raise pyfuse3.FUSEError(errno.EAGAIN)
             self._record_event("limiter_wait", name, fh, t_limiter_start, t_limiter_end)
             try:
                 on_aclose = self._make_aclose_recorder(name, fh)
-                conn = await self._client.open_bed(on_aclose=on_aclose)
+                conn = await self._client.open_stream(on_aclose=on_aclose)
             except OSError as exc:
-                self._bed_limiter.release_on_behalf_of(fh)
+                self._stream_limiter.release_on_behalf_of(fh)
                 raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
             except BaseException:
-                self._bed_limiter.release_on_behalf_of(fh)
+                self._stream_limiter.release_on_behalf_of(fh)
                 raise
             self._fh_to_conn[fh] = conn
         self._fh_to_kind[fh] = kind
@@ -234,14 +260,13 @@ class PlinkOps(pyfuse3.Operations):
         kind = self._fh_to_kind.get(fh)
         name = self._fh_to_name.get(fh)
         conn = self._fh_to_conn.get(fh)
-        if kind is None:
+        if kind is None or name is None:
             raise pyfuse3.FUSEError(errno.EBADF)
         t_start = time.monotonic()
-        if kind == "bim":
-            data = self._read_static(self._client.bim_bytes, off, size)
-        elif kind == "fam":
-            data = self._read_static(self._client.fam_bytes, off, size)
-        elif kind == "bed":
+        if kind == _STATIC_KIND:
+            index = self._name_to_static_index[name]
+            data = self._read_static(self._client.static_bytes[index], off, size)
+        elif kind == self._spec.streaming_kind:
             assert conn is not None
             try:
                 data = await conn.read(off, size)
@@ -272,10 +297,10 @@ class PlinkOps(pyfuse3.Operations):
                 try:
                     await conn.aclose()
                 except Exception as exc:  # noqa: BLE001 - best-effort cleanup
-                    logger.debug("bed connection close raised: %s", exc)
+                    logger.debug("stream connection close raised: %s", exc)
         finally:
-            if kind == "bed":
-                self._bed_limiter.release_on_behalf_of(fh)
+            if kind == self._spec.streaming_kind:
+                self._stream_limiter.release_on_behalf_of(fh)
             self._record_event("release", name, fh, t_release_start)
 
     async def forget(self, inode_list):

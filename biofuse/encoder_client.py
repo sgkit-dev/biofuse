@@ -1,11 +1,12 @@
-"""Parent-side async client for the plink-server subprocess.
+"""Parent-side async client for the encoder-server subprocess.
 
-:class:`PlinkClient` connects briefly at startup to fetch the static
-``.bim`` / ``.fam`` bytes and the ``.bed`` size, then for each
-``.bed`` ``open()`` from the FUSE layer it spins up a fresh
-:class:`BedConnection` over a new ``AF_UNIX`` socket. Each
-``BedConnection`` is its own conversation with its own server-side
-thread and ``BedEncoder``.
+:class:`EncoderClient` connects briefly at startup to fetch the
+precomputed static-sidecar bytes (in the format spec's declared
+order) and the streaming-file size, then for each streaming-file
+``open()`` from the FUSE layer it spins up a fresh
+:class:`StreamConnection` over a new ``AF_UNIX`` socket. Each
+:class:`StreamConnection` is its own conversation with its own
+server-side thread and encoder.
 """
 
 import errno
@@ -19,7 +20,7 @@ from collections.abc import Callable
 import trio
 from vcztools import cli as vcztools_cli
 
-from biofuse import plink_protocol, plink_server
+from biofuse import encoder_protocol, encoder_server, formats
 
 logger = logging.getLogger(__name__)
 
@@ -38,12 +39,12 @@ _OPEN_TIMEOUT_S = 5.0
 _ACLOSE_TIMEOUT_S = 2.0
 
 
-class BedConnection:
-    """One ``.bed`` reader: a dedicated socket to the plink-server.
+class StreamConnection:
+    """One streaming-file reader: a dedicated socket to the encoder-server.
 
     Reads on the same connection are serialised via an internal
     ``trio.Lock`` because the wire protocol is request/reply
-    synchronous on a single socket. Different ``BedConnection``
+    synchronous on a single socket. Different :class:`StreamConnection`
     instances are fully independent — they live in different server
     threads and do not contend with each other.
     """
@@ -61,19 +62,19 @@ class BedConnection:
 
     async def read(self, off: int, size: int) -> bytes:
         if self._closed:
-            raise OSError(errno.EIO, "bed connection is closed")
-        request = plink_protocol.pack_read_request(off, size)
+            raise OSError(errno.EIO, "stream connection is closed")
+        request = encoder_protocol.pack_read_request(off, size)
         with trio.move_on_after(_REQUEST_TIMEOUT_S) as cs:
             async with self._lock:
                 if self._closed:
-                    raise OSError(errno.EIO, "bed connection is closed")
+                    raise OSError(errno.EIO, "stream connection is closed")
                 await self._stream.send_all(request)
                 status_buf = await _recv_exact(
-                    self._stream, plink_protocol.REPLY_STATUS_SIZE
+                    self._stream, encoder_protocol.REPLY_STATUS_SIZE
                 )
-                status = plink_protocol.parse_status(status_buf)
+                status = encoder_protocol.parse_status(status_buf)
                 if status < 0:
-                    raise plink_protocol.status_to_error(status)
+                    raise encoder_protocol.status_to_error(status)
                 if status == 0:
                     return b""
                 return await _recv_exact(self._stream, status)
@@ -83,7 +84,7 @@ class BedConnection:
         # to an immediate EIO instead of repeating the wait against a
         # known-broken socket.
         if not cs.cancelled_caught:  # pragma: no cover - defensive
-            raise RuntimeError("plink-server read fall-through")
+            raise RuntimeError("encoder-server read fall-through")
         self._closed = True
         with trio.CancelScope(shield=True):
             with trio.move_on_after(_ACLOSE_TIMEOUT_S):
@@ -91,7 +92,7 @@ class BedConnection:
                     await self._stream.aclose()
                 except (trio.BrokenResourceError, OSError) as exc:
                     logger.debug("aclose after timeout raised: %s", exc)
-        raise OSError(errno.EIO, "plink-server request timed out")
+        raise OSError(errno.EIO, "encoder-server request timed out")
 
     async def aclose(self) -> None:
         if self._closed:
@@ -107,11 +108,11 @@ class BedConnection:
                     trio.BrokenResourceError,
                     OSError,
                 ) as exc:
-                    logger.debug("send_eof on bed connection raised: %s", exc)
+                    logger.debug("send_eof on stream connection raised: %s", exc)
                 await self._stream.aclose()
             if cs.cancelled_caught:
                 logger.debug(
-                    "bed connection aclose timed out after %.1fs",
+                    "stream connection aclose timed out after %.1fs",
                     _ACLOSE_TIMEOUT_S,
                 )
         if self._on_aclose is not None:
@@ -121,35 +122,45 @@ class BedConnection:
                 logger.debug("on_aclose hook raised: %s", exc)
 
 
-class PlinkClient:
-    """Parent-side client for one mounted plink-server subprocess.
+class EncoderClient:
+    """Parent-side client for one mounted encoder-server subprocess.
 
-    Construct via :meth:`PlinkClient.start` (an async classmethod
+    Construct via :meth:`EncoderClient.start` (an async classmethod
     that spawns the server, runs the metadata handshake, and returns
     the ready client). The instance is also an async context manager;
     ``aclose()`` signals the server to stop, joins the subprocess,
     and unlinks the listener socket file.
+
+    Attributes populated by the handshake:
+
+    - ``static_bytes``: list parallel to ``spec.static_suffixes`` holding
+      the precomputed sidecar bodies.
+    - ``stream_size``: total byte size of the streaming file.
     """
 
-    def __init__(self) -> None:
-        # Populated in start().
-        self.bim_bytes: bytes = b""
-        self.fam_bytes: bytes = b""
-        self.bed_size: int = 0
+    def __init__(self, spec: formats.FormatSpec) -> None:
+        self.spec = spec
+        self.static_bytes: list[bytes] = []
+        self.stream_size: int = 0
         self._proc: mp.process.BaseProcess | None = None
         self._socket_path: pathlib.Path | None = None
         self._stop_sock: socket.socket | None = None
         self._closed = False
+
+    @property
+    def static_suffixes(self) -> tuple[str, ...]:
+        return self.spec.static_suffixes
 
     @classmethod
     async def start(
         cls,
         vcz_url: str,
         socket_path: pathlib.Path,
+        spec: formats.FormatSpec,
         *,
         reader_options: vcztools_cli.ViewPlinkOptions | None = None,
         log_config: vcztools_cli.LogConfig | None = None,
-    ) -> "PlinkClient":
+    ) -> "EncoderClient":
         """Spawn the server, run the metadata handshake, return client.
 
         The parent creates the listener and the stop-signal socketpair
@@ -177,9 +188,9 @@ class PlinkClient:
         parent_stop, child_stop = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         ctx = mp.get_context("spawn")
         proc: mp.process.BaseProcess = ctx.Process(
-            target=plink_server._server_main,
-            args=(listener, child_stop, vcz_url, reader_options, log_config),
-            name="biofuse-plink-server",
+            target=encoder_server._server_main,
+            args=(listener, child_stop, vcz_url, spec, reader_options, log_config),
+            name=f"biofuse-{spec.name}-server",
         )
         try:
             proc.start()
@@ -187,7 +198,7 @@ class PlinkClient:
             listener.close()
             child_stop.close()
 
-        self = cls()
+        self = cls(spec)
         self._proc = proc
         self._socket_path = socket_path
         self._stop_sock = parent_stop
@@ -204,25 +215,26 @@ class PlinkClient:
             if proc.exitcode is not None and not isinstance(exc, KeyboardInterrupt):
                 raise OSError(
                     errno.EIO,
-                    "plink-server exited during startup; see log above for details",
+                    f"{spec.name}-server exited during startup; "
+                    "see log above for details",
                 ) from exc
             raise
         return self
 
-    async def __aenter__(self) -> "PlinkClient":
+    async def __aenter__(self) -> "EncoderClient":
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.aclose()
 
-    async def open_bed(
+    async def open_stream(
         self,
         *,
         on_aclose: Callable[[float, float], None] | None = None,
-    ) -> BedConnection:
-        """Open a new dedicated socket for one ``.bed`` reader."""
+    ) -> StreamConnection:
+        """Open a new dedicated socket for one streaming-file reader."""
         stream = await self._connect_stream()
-        return BedConnection(stream, on_aclose=on_aclose)
+        return StreamConnection(stream, on_aclose=on_aclose)
 
     async def aclose(self) -> None:
         """Tear down the server. Idempotent.
@@ -254,16 +266,28 @@ class PlinkClient:
     async def _handshake(self) -> None:
         stream = await self._connect_stream(retry_until_listening=True)
         try:
-            await stream.send_all(plink_protocol.pack_get_metadata_request())
-            status_buf = await _recv_exact(stream, plink_protocol.REPLY_STATUS_SIZE)
-            status = plink_protocol.parse_status(status_buf)
+            await stream.send_all(encoder_protocol.pack_get_metadata_request())
+            status_buf = await _recv_exact(stream, encoder_protocol.REPLY_STATUS_SIZE)
+            status = encoder_protocol.parse_status(status_buf)
             if status < 0:
-                raise plink_protocol.status_to_error(status)
-            header = await _recv_exact(stream, plink_protocol.META_HEADER_SIZE)
-            bim_size, fam_size, bed_size = plink_protocol.parse_metadata_header(header)
-            self.bim_bytes = await _recv_exact(stream, bim_size)
-            self.fam_bytes = await _recv_exact(stream, fam_size)
-            self.bed_size = bed_size
+                raise encoder_protocol.status_to_error(status)
+            prefix = await _recv_exact(stream, encoder_protocol.META_PREFIX_SIZE)
+            n_static, stream_size = encoder_protocol.parse_metadata_prefix(prefix)
+            if n_static != len(self.spec.static_suffixes):
+                raise OSError(
+                    errno.EIO,
+                    f"{self.spec.name}-server reported {n_static} static files; "
+                    f"client expected {len(self.spec.static_suffixes)}",
+                )
+            sizes_buf = await _recv_exact(
+                stream, n_static * encoder_protocol.META_SIZE_ENTRY_SIZE
+            )
+            sizes = encoder_protocol.parse_static_sizes(sizes_buf, n_static)
+            static_bytes: list[bytes] = []
+            for size in sizes:
+                static_bytes.append(await _recv_exact(stream, size))
+            self.static_bytes = static_bytes
+            self.stream_size = stream_size
         finally:
             try:
                 await stream.send_eof()
@@ -303,7 +327,7 @@ class PlinkClient:
                 trio_sock.close()
                 raise OSError(
                     errno.EIO,
-                    f"plink-server connect timed out after {_OPEN_TIMEOUT_S:.1f}s",
+                    f"encoder-server connect timed out after {_OPEN_TIMEOUT_S:.1f}s",
                 ) from exc
             except (FileNotFoundError, ConnectionRefusedError, OSError) as exc:
                 trio_sock.close()
@@ -313,12 +337,13 @@ class PlinkClient:
                 if self._proc is not None and not self._proc.is_alive():
                     raise OSError(
                         errno.EIO,
-                        "plink-server exited during startup; see log above for details",
+                        f"{self.spec.name}-server exited during startup; "
+                        "see log above for details",
                     ) from last_exc
                 if trio.current_time() > deadline:
                     raise OSError(
                         errno.EIO,
-                        f"plink-server not listening at {path}: {exc}",
+                        f"{self.spec.name}-server not listening at {path}: {exc}",
                     ) from last_exc
                 await trio.sleep(_CONNECT_RETRY_SLEEP_S)
 
@@ -329,11 +354,13 @@ class PlinkClient:
         if proc.is_alive():
             proc.join(timeout=_SHUTDOWN_GRACE_SECONDS)
         if proc.is_alive():
-            logger.warning("plink-server did not exit; sending SIGTERM")
+            logger.warning("%s-server did not exit; sending SIGTERM", self.spec.name)
             proc.terminate()
             proc.join(timeout=_SHUTDOWN_GRACE_SECONDS)
         if proc.is_alive():
-            logger.warning("plink-server still alive after SIGTERM; killing")
+            logger.warning(
+                "%s-server still alive after SIGTERM; killing", self.spec.name
+            )
             proc.kill()
             proc.join(timeout=_SHUTDOWN_GRACE_SECONDS)
 
@@ -353,7 +380,7 @@ async def _recv_exact(stream: trio.SocketStream, n: int) -> bytes:
     while got < n:
         chunk = await stream.receive_some(n - got)
         if len(chunk) == 0:
-            raise OSError(errno.EIO, "plink-server closed socket")
+            raise OSError(errno.EIO, "encoder-server closed socket")
         view[got : got + len(chunk)] = chunk
         got += len(chunk)
     return bytes(buf)
