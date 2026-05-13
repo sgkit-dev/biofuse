@@ -38,8 +38,8 @@ def fx_spec(request):
 def fx_expected(fx_reader, fx_spec):
     """Spec-direct reference outputs.
 
-    Returns ``(spec, static_bodies, stream_size)`` produced by calling
-    ``spec.build_static_bytes`` / the throwaway encoder directly. This is
+    Returns ``(spec, static_files, stream_size)`` produced by calling
+    ``spec.build_static_files`` / the throwaway encoder directly. This is
     the source of truth for the server's behaviour; on-disk goldens via
     ``write_plink`` / ``write_bgen`` are not used here because BGEN's
     ``write_bgen`` defaults to a compressed (non-fixed-size) layout that
@@ -47,10 +47,10 @@ def fx_expected(fx_reader, fx_spec):
     and SQLite ``.bgi`` files written in separate calls have
     non-deterministic page metadata.
     """
-    static_bodies = fx_spec.build_static_bytes(fx_reader)
+    static_files = fx_spec.build_static_files(fx_reader)
     with fx_spec.encoder_factory(fx_reader) as encoder:
         stream_size = int(encoder.total_size)
-    return fx_spec, static_bodies, stream_size
+    return fx_spec, static_files, stream_size
 
 
 @pytest.fixture
@@ -96,17 +96,15 @@ def _spawn_handle_connection(
 
 
 class TestServerSession:
-    def test_static_bytes_match_spec_output(self, fx_session, fx_expected):
+    def test_static_files_match_spec_output(self, fx_session, fx_expected):
         _, expected_static, _ = fx_expected
-        assert len(fx_session.static_bodies) == len(expected_static)
-        for got, expected in zip(
-            fx_session.static_bodies, expected_static, strict=True
-        ):
+        assert set(fx_session.static_files) == set(expected_static)
+        for suffix in expected_static:
             # ``.bgi`` SQLite bytes can differ across independent writes
             # in non-payload header fields, so compare sizes rather than
             # bytes for the .bgi entry; per-byte parity is covered in
             # the apps suite by reading via the live mount.
-            assert len(got) == len(expected)
+            assert len(fx_session.static_files[suffix]) == len(expected_static[suffix])
 
     def test_stream_size_matches_encoder_total_size(self, fx_session, fx_expected):
         _, _, expected_stream_size = fx_expected
@@ -122,7 +120,9 @@ class TestHandleConnectionMetadata:
             status, body = _read_status_and_body(parent)
             n_static = len(spec.static_suffixes)
             sizes_size = n_static * encoder_protocol.META_SIZE_ENTRY_SIZE
-            static_sizes = [len(b) for b in fx_session.static_bodies]
+            static_sizes = [
+                len(fx_session.static_files[suffix]) for suffix in spec.static_suffixes
+            ]
             expected_body_size = (
                 encoder_protocol.META_PREFIX_SIZE + sizes_size + sum(static_sizes)
             )
@@ -139,8 +139,8 @@ class TestHandleConnectionMetadata:
             )
             assert sizes == tuple(static_sizes)
             offset = sizes_end
-            for body_bytes, size in zip(fx_session.static_bodies, sizes, strict=True):
-                assert body[offset : offset + size] == body_bytes
+            for suffix, size in zip(spec.static_suffixes, sizes, strict=True):
+                assert body[offset : offset + size] == fx_session.static_files[suffix]
                 offset += size
         finally:
             parent.close()

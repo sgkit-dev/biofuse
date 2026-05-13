@@ -38,7 +38,7 @@ def fx_expected(fx_reader, fx_spec):
     Built directly from the spec to avoid the BGEN / SQLite ``.bgi``
     non-determinism caveats documented in :mod:`test_encoder_server`.
     """
-    static = fx_spec.build_static_bytes(fx_reader)
+    static = fx_spec.build_static_files(fx_reader)
     with fx_spec.encoder_factory(fx_reader) as encoder:
         stream_size = int(encoder.total_size)
     return fx_spec, static, stream_size
@@ -101,7 +101,7 @@ async def _client_with_thread_server(
     server = _ThreadServer(reader, spec, socket_path)
     self = encoder_client.EncoderClient.__new__(encoder_client.EncoderClient)
     self.spec = spec
-    self.static_bytes = []
+    self.static_files = {}
     self.stream_size = 0
     self._proc = server
     self._socket_path = socket_path
@@ -130,9 +130,9 @@ class TestHandshake:
         spec, expected_static, expected_stream_size = fx_expected
         assert fx_client.spec is spec
         assert fx_client.stream_size == expected_stream_size
-        assert len(fx_client.static_bytes) == len(expected_static)
-        for got, expected in zip(fx_client.static_bytes, expected_static, strict=True):
-            assert len(got) == len(expected)
+        assert set(fx_client.static_files) == set(expected_static)
+        for suffix in expected_static:
+            assert len(fx_client.static_files[suffix]) == len(expected_static[suffix])
 
 
 class TestStreamConnection:
@@ -382,10 +382,9 @@ class TestRealSubprocess:
             reader_options=vcztools_cli.ViewPlinkOptions(max_alleles=2),
         )
         try:
-            bim_bytes, fam_bytes = client.static_bytes
-            bim_lines = bim_bytes.decode("utf-8").splitlines()
+            bim_lines = client.static_files[".bim"].decode("utf-8").splitlines()
             assert len(bim_lines) == fx_multiallelic_vcz.num_biallelic_sites
-            fam_lines = fam_bytes.decode("utf-8").splitlines()
+            fam_lines = client.static_files[".fam"].decode("utf-8").splitlines()
             assert len(fam_lines) == fx_multiallelic_vcz.num_samples
             bytes_per_variant = (fx_multiallelic_vcz.num_samples + 3) // 4
             expected_bed_size = (
@@ -421,7 +420,7 @@ class TestRealSubprocess:
         )
         try:
             assert client.stream_size == expected_stream_size
-            assert len(client.static_bytes) == len(spec.static_suffixes)
+            assert set(client.static_files) == set(spec.static_suffixes)
             conn = await client.open_stream()
             try:
                 data = await conn.read(0, client.stream_size)

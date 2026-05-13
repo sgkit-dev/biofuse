@@ -70,23 +70,23 @@ class _FakeStreamConnection:
 class _FakeClient:
     """In-process stand-in for :class:`biofuse.encoder_client.EncoderClient`.
 
-    Holds canned ``static_bytes`` / ``stream_size`` / ``static_suffixes``
-    and hands out :class:`_FakeStreamConnection` instances on demand.
+    Holds canned ``static_files`` / ``stream_size`` and hands out
+    :class:`_FakeStreamConnection` instances on demand.
     """
 
     def __init__(
         self,
         spec: formats.FormatSpec,
-        static_bytes: list[bytes] | None = None,
+        static_files: dict[str, bytes] | None = None,
         stream_size: int = 1024,
     ) -> None:
         self.spec = spec
-        self.static_suffixes = spec.static_suffixes
-        if static_bytes is None:
-            static_bytes = [
-                b"STATIC" * (32 * (i + 1)) for i in range(len(spec.static_suffixes))
-            ]
-        self.static_bytes = static_bytes
+        if static_files is None:
+            static_files = {
+                suffix: b"STATIC" * (32 * (i + 1))
+                for i, suffix in enumerate(spec.static_suffixes)
+            }
+        self.static_files = static_files
         self.stream_size = stream_size
         self.calls: list[tuple] = []
         self._next_open_error: OSError | None = None
@@ -135,6 +135,11 @@ def fx_first_static_name(fx_spec):
     return f"small{fx_spec.static_suffixes[0]}"
 
 
+@pytest.fixture
+def fx_first_static_bytes(fx_client, fx_spec):
+    return fx_client.static_files[fx_spec.static_suffixes[0]]
+
+
 async def _expect_fuse_error(coro, expected_errno):
     with pytest.raises(pyfuse3.FUSEError) as excinfo:
         await coro
@@ -158,8 +163,8 @@ class TestConstructor:
         ops = encoder_ops.EncoderOps(fx_client, "small", fx_spec)
         sizes = {ops._inode_to_name[i]: size for i, size in ops._inode_to_size.items()}
         expected = {f"small{fx_spec.streaming_suffix}": fx_client.stream_size}
-        for index, suffix in enumerate(fx_spec.static_suffixes):
-            expected[f"small{suffix}"] = len(fx_client.static_bytes[index])
+        for suffix in fx_spec.static_suffixes:
+            expected[f"small{suffix}"] = len(fx_client.static_files[suffix])
         assert sizes == expected
 
     def test_inodes_assigned_in_sorted_order(self, fx_ops):
@@ -311,41 +316,38 @@ class TestRead:
             await fx_ops.release(info.fh)
 
     async def test_static_read_serves_from_cached_bytes(
-        self, fx_ops, fx_client, fx_first_static_name
+        self, fx_ops, fx_client, fx_first_static_name, fx_first_static_bytes
     ):
         inode = fx_ops._name_to_inode[fx_first_static_name]
         info = await fx_ops.open(inode, os.O_RDONLY)
         try:
-            expected = fx_client.static_bytes[0]
-            data = await fx_ops.read(info.fh, 0, len(expected))
-            assert data == expected
+            data = await fx_ops.read(info.fh, 0, len(fx_first_static_bytes))
+            assert data == fx_first_static_bytes
             # No client traffic for static reads.
             assert all(c[0] != "read" for c in fx_client.calls)
         finally:
             await fx_ops.release(info.fh)
 
     async def test_static_read_past_eof_returns_empty(
-        self, fx_ops, fx_client, fx_first_static_name
+        self, fx_ops, fx_first_static_name, fx_first_static_bytes
     ):
         inode = fx_ops._name_to_inode[fx_first_static_name]
         info = await fx_ops.open(inode, os.O_RDONLY)
         try:
-            expected = fx_client.static_bytes[0]
-            data = await fx_ops.read(info.fh, len(expected) + 100, 50)
+            data = await fx_ops.read(info.fh, len(fx_first_static_bytes) + 100, 50)
             assert data == b""
         finally:
             await fx_ops.release(info.fh)
 
     async def test_static_read_spanning_eof_returns_truncated(
-        self, fx_ops, fx_client, fx_first_static_name
+        self, fx_ops, fx_first_static_name, fx_first_static_bytes
     ):
         inode = fx_ops._name_to_inode[fx_first_static_name]
         info = await fx_ops.open(inode, os.O_RDONLY)
         try:
-            expected = fx_client.static_bytes[0]
-            tail_off = len(expected) - 5
+            tail_off = len(fx_first_static_bytes) - 5
             data = await fx_ops.read(info.fh, tail_off, 100)
-            assert data == expected[tail_off:]
+            assert data == fx_first_static_bytes[tail_off:]
         finally:
             await fx_ops.release(info.fh)
 
@@ -553,7 +555,9 @@ class TestStatfs:
 
     async def test_block_count_matches_sum_of_file_sizes(self, fx_ops, fx_client):
         out = await fx_ops.statfs()
-        total = fx_client.stream_size + sum(len(b) for b in fx_client.static_bytes)
+        total = fx_client.stream_size + sum(
+            len(b) for b in fx_client.static_files.values()
+        )
         assert out.f_bsize > 0
         assert out.f_frsize == out.f_bsize
         assert out.f_blocks == (total + out.f_bsize - 1) // out.f_bsize

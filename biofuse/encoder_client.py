@@ -133,23 +133,19 @@ class EncoderClient:
 
     Attributes populated by the handshake:
 
-    - ``static_bytes``: list parallel to ``spec.static_suffixes`` holding
-      the precomputed sidecar bodies.
+    - ``static_files``: dict mapping each suffix declared in
+      ``spec.static_suffixes`` to its precomputed bytes.
     - ``stream_size``: total byte size of the streaming file.
     """
 
     def __init__(self, spec: formats.FormatSpec) -> None:
         self.spec = spec
-        self.static_bytes: list[bytes] = []
+        self.static_files: dict[str, bytes] = {}
         self.stream_size: int = 0
         self._proc: mp.process.BaseProcess | None = None
         self._socket_path: pathlib.Path | None = None
         self._stop_sock: socket.socket | None = None
         self._closed = False
-
-    @property
-    def static_suffixes(self) -> tuple[str, ...]:
-        return self.spec.static_suffixes
 
     @classmethod
     async def start(
@@ -283,10 +279,10 @@ class EncoderClient:
                 stream, n_static * encoder_protocol.META_SIZE_ENTRY_SIZE
             )
             sizes = encoder_protocol.parse_static_sizes(sizes_buf, n_static)
-            static_bytes: list[bytes] = []
-            for size in sizes:
-                static_bytes.append(await _recv_exact(stream, size))
-            self.static_bytes = static_bytes
+            self.static_files = {
+                suffix: await _recv_exact(stream, size)
+                for suffix, size in zip(self.spec.static_suffixes, sizes, strict=True)
+            }
             self.stream_size = stream_size
         finally:
             try:

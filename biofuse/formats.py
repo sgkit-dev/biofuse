@@ -53,12 +53,17 @@ class FormatSpec:
     """``EncoderOps`` dispatch key for the streaming file."""
 
     static_suffixes: tuple[str, ...]
-    """Suffixes of the static sidecar files, in payload order."""
+    """Suffixes of the static sidecar files, in canonical wire order.
 
-    build_static_bytes: Callable[[vcztools_retrieval.VczReader], list[bytes]]
+    The wire protocol serialises static-file bodies in this order;
+    :meth:`build_static_files` must return a dict whose keys equal
+    this tuple."""
+
+    build_static_files: Callable[[vcztools_retrieval.VczReader], dict[str, bytes]]
     """Build the static sidecars for ``reader``.
 
-    Returns a list parallel to :attr:`static_suffixes`."""
+    Returns a dict ``{suffix: bytes}`` whose keys equal
+    :attr:`static_suffixes`."""
 
     encoder_factory: Callable[
         [vcztools_retrieval.VczReader],
@@ -67,13 +72,14 @@ class FormatSpec:
     """Construct one fresh encoder for one server connection."""
 
 
-def _build_plink_static(reader: vcztools_retrieval.VczReader) -> list[bytes]:
-    bim = vcztools_plink.generate_bim(reader).encode("utf-8")
-    fam = vcztools_plink.generate_fam(reader).encode("utf-8")
-    return [bim, fam]
+def _build_plink_static(reader: vcztools_retrieval.VczReader) -> dict[str, bytes]:
+    return {
+        ".bim": vcztools_plink.generate_bim(reader).encode("utf-8"),
+        ".fam": vcztools_plink.generate_fam(reader).encode("utf-8"),
+    }
 
 
-def _build_bgen_static(reader: vcztools_retrieval.VczReader) -> list[bytes]:
+def _build_bgen_static(reader: vcztools_retrieval.VczReader) -> dict[str, bytes]:
     sample = vcztools_bgen.generate_sample(reader).encode("utf-8")
     # ``write_bgen_index`` takes a filesystem path. Materialise the .bgi
     # to a tempfile, read the bytes back, then unlink. The encoder used
@@ -92,7 +98,7 @@ def _build_bgen_static(reader: vcztools_retrieval.VczReader) -> list[bytes]:
             tmp_path.unlink()
         except OSError:
             pass
-    return [sample, bgi]
+    return {".sample": sample, ".bgen.bgi": bgi}
 
 
 def _plink_encoder_factory(
@@ -112,7 +118,7 @@ PLINK_SPEC = FormatSpec(
     streaming_suffix=".bed",
     streaming_kind="bed",
     static_suffixes=(".bim", ".fam"),
-    build_static_bytes=_build_plink_static,
+    build_static_files=_build_plink_static,
     encoder_factory=_plink_encoder_factory,
 )
 
@@ -122,7 +128,7 @@ BGEN_SPEC = FormatSpec(
     streaming_suffix=".bgen",
     streaming_kind="bgen",
     static_suffixes=(".sample", ".bgen.bgi"),
-    build_static_bytes=_build_bgen_static,
+    build_static_files=_build_bgen_static,
     encoder_factory=_bgen_encoder_factory,
 )
 

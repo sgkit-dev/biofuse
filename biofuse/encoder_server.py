@@ -7,7 +7,7 @@ selects:
 
 - which static sidecar files to precompute and cache (``.bim``/``.fam``
   for PLINK; ``.sample``/``.bgen.bgi`` for BGEN), via
-  :meth:`FormatSpec.build_static_bytes`;
+  :meth:`FormatSpec.build_static_files`;
 - which encoder class to construct per accepted connection, via
   :meth:`FormatSpec.encoder_factory`.
 
@@ -51,7 +51,14 @@ class _ServerSession:
     ) -> None:
         self.reader = reader
         self.spec = spec
-        self.static_bodies: list[bytes] = spec.build_static_bytes(reader)
+        self.static_files: dict[str, bytes] = spec.build_static_files(reader)
+        missing = set(spec.static_suffixes) - set(self.static_files)
+        extra = set(self.static_files) - set(spec.static_suffixes)
+        if missing or extra:
+            raise ValueError(
+                f"{spec.name}: build_static_files returned keys "
+                f"{sorted(self.static_files)}; expected {list(spec.static_suffixes)}"
+            )
         # Open one throwaway encoder to read ``total_size`` — encoder
         # construction is I/O-free, so this is cheap. Per-connection
         # encoders are constructed fresh in ``_handle_connection``.
@@ -121,8 +128,12 @@ def _handle_connection(conn_sock: socket.socket, session: _ServerSession) -> Non
                 tag = bytes(tag_buf)
                 try:
                     if tag == encoder_protocol.TAG_GET_METADATA:
+                        ordered_bodies = [
+                            session.static_files[suffix]
+                            for suffix in session.spec.static_suffixes
+                        ]
                         reply = encoder_protocol.pack_metadata_reply(
-                            session.static_bodies, session.stream_size
+                            ordered_bodies, session.stream_size
                         )
                     elif tag == encoder_protocol.TAG_READ:
                         payload = _recv_exact_sync(

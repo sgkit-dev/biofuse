@@ -64,9 +64,8 @@ class EncoderClientProto(Protocol):
     a subprocess.
     """
 
-    static_bytes: list[bytes]
+    static_files: dict[str, bytes]
     stream_size: int
-    static_suffixes: tuple[str, ...]
 
     async def open_stream(self) -> _StreamConnectionProto: ...
 
@@ -122,17 +121,17 @@ class EncoderOps(pyfuse3.Operations):
         # static suffix. Each entry has a kind that drives read dispatch:
         # the streaming file's kind is the spec's ``streaming_kind``;
         # all static files share the same ``_STATIC_KIND`` dispatch key.
-        # ``_name_to_static_index`` maps each static filename to its
-        # index in ``client.static_bytes``.
+        # ``_name_to_suffix`` maps each static filename to its suffix
+        # for lookups into ``client.static_files``.
         stream_name = f"{basename}{spec.streaming_suffix}"
         manifest: list[tuple[str, str, int]] = [
             (stream_name, spec.streaming_kind, client.stream_size)
         ]
-        self._name_to_static_index: dict[str, int] = {}
-        for index, suffix in enumerate(spec.static_suffixes):
+        self._name_to_suffix: dict[str, str] = {}
+        for suffix in spec.static_suffixes:
             name = f"{basename}{suffix}"
-            manifest.append((name, _STATIC_KIND, len(client.static_bytes[index])))
-            self._name_to_static_index[name] = index
+            manifest.append((name, _STATIC_KIND, len(client.static_files[suffix])))
+            self._name_to_suffix[name] = suffix
         manifest.sort()
 
         self._inode_to_name: dict[int, str] = {}
@@ -264,8 +263,8 @@ class EncoderOps(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EBADF)
         t_start = time.monotonic()
         if kind == _STATIC_KIND:
-            index = self._name_to_static_index[name]
-            data = self._read_static(self._client.static_bytes[index], off, size)
+            suffix = self._name_to_suffix[name]
+            data = self._read_static(self._client.static_files[suffix], off, size)
         elif kind == self._spec.streaming_kind:
             assert conn is not None
             try:
