@@ -484,6 +484,32 @@ class TestCapacityLimiter:
         finally:
             await ops.release(held.fh)
 
+    async def test_limiter_timeout_records_access_event(
+        self, fx_client, fx_spec, monkeypatch
+    ):
+        """A timed-out FUSE_OPEN must leave a ``limiter_timeout`` event
+        in the access log so post-hoc analysis can attribute an
+        ``EAGAIN`` to limiter starvation rather than some other path."""
+        timeout_s = 0.2
+        monkeypatch.setattr(encoder_ops, "_LIMITER_TIMEOUT_S", timeout_s)
+        log = access_log.AccessLogger()
+        ops = encoder_ops.EncoderOps(
+            fx_client, "small", fx_spec, max_open_stream=1, access_logger=log
+        )
+        stream_inode = ops._name_to_inode[f"small{fx_spec.streaming_suffix}"]
+        held = await ops.open(stream_inode, os.O_RDONLY)
+        try:
+            await _expect_fuse_error(ops.open(stream_inode, os.O_RDONLY), errno.EAGAIN)
+        finally:
+            await ops.release(held.fh)
+        timeouts = [r for r in log.records if r.kind == "limiter_timeout"]
+        assert len(timeouts) == 1
+        rec = timeouts[0]
+        # The held open ran first and got fh=1; the timed-out attempt is
+        # the next allocated fh.
+        assert rec.fh == held.fh + 1
+        assert rec.t_end - rec.t_start >= timeout_s
+
 
 class TestLifecycleEvents:
     """``open`` / ``release`` / ``aclose`` / ``limiter_wait`` events
