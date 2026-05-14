@@ -80,6 +80,109 @@ def _recv_exact_sync(sock: socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 
+def _make_error_reply(exc: BaseException, context: str) -> bytes:
+    """Pack an errno reply for ``exc`` and log the cause.
+
+    Non-``OSError`` causes log a one-line ERROR with the errno and
+    the exception text, plus a DEBUG-only traceback. Used by both
+    the encoder-construction failure path and the per-dispatch
+    exception handler.
+    """
+    err = encoder_protocol.errno_for_exception(exc)
+    if not isinstance(exc, OSError):
+        logger.error("encoder-server %s; replying with errno %d: %s", context, err, exc)
+        logger.debug("encoder-server %s traceback", context, exc_info=True)
+    return encoder_protocol.pack_error_reply(err)
+
+
+def _make_metadata_reply(session: "_ServerSession") -> bytes:
+    """Build the reply for a ``TAG_GET_METADATA`` request.
+
+    The static sidecars are built on demand from the format spec,
+    serialised into the reply, then dropped: the parent fuse handler
+    owns the canonical copy after the handshake.
+    """
+    static_files = session.spec.build_static_files(session.reader)
+    missing = set(session.spec.static_suffixes) - set(static_files)
+    extra = set(static_files) - set(session.spec.static_suffixes)
+    if missing or extra:
+        raise ValueError(
+            f"{session.spec.name}: build_static_files returned keys "
+            f"{sorted(static_files)}; expected {list(session.spec.static_suffixes)}"
+        )
+    ordered_bodies = [static_files[suffix] for suffix in session.spec.static_suffixes]
+    return encoder_protocol.pack_metadata_reply(ordered_bodies, session.stream_size)
+
+
+def _make_read_reply(conn_sock: socket.socket, encoder, tname: str) -> bytes | None:
+    """Build the reply for a ``TAG_READ`` request, or ``None`` on
+    truncated payload (caller terminates the connection)."""
+    payload = _recv_exact_sync(conn_sock, encoder_protocol.REQ_READ_PAYLOAD_SIZE)
+    if len(payload) < encoder_protocol.REQ_READ_PAYLOAD_SIZE:
+        return None
+    off, size = encoder_protocol.parse_read_payload(payload)
+    t_read = time.monotonic()
+    data = encoder.read(off, size)
+    logger.debug(
+        "%s: encoder.read off=%d size=%d in %.3fs",
+        tname,
+        off,
+        size,
+        time.monotonic() - t_read,
+    )
+    return encoder_protocol.pack_read_reply(data)
+
+
+def _send_reply(conn_sock: socket.socket, reply: bytes) -> bool:
+    """Send ``reply`` on the socket; return ``True`` on success and
+    ``False`` if the send raised ``OSError`` (already logged)."""
+    try:
+        conn_sock.sendall(reply)
+        return True
+    except OSError as exc:
+        logger.warning("encoder-server send failed: %s", exc)
+        return False
+
+
+def _serve_connection(
+    conn_sock: socket.socket,
+    session: "_ServerSession",
+    encoder,
+    tname: str,
+) -> None:
+    """Run the tag-dispatch loop for one connected client.
+
+    Exits cleanly on EOF, unknown tag, truncated payload, or a send
+    failure. Exceptions raised inside a dispatch case are converted
+    to errno replies and the loop continues to the next request.
+    """
+    while True:
+        try:
+            tag_buf = _recv_exact_sync(conn_sock, 1)
+        except EOFError as exc:
+            logger.warning("encoder-server frame error: %s", exc)
+            return
+        if len(tag_buf) == 0:
+            return
+        tag = bytes(tag_buf)
+        try:
+            if tag == encoder_protocol.TAG_GET_METADATA:
+                reply = _make_metadata_reply(session)
+            elif tag == encoder_protocol.TAG_READ:
+                reply = _make_read_reply(conn_sock, encoder, tname)
+            else:
+                logger.warning(
+                    "encoder-server: unknown tag %r; closing connection", tag
+                )
+                return
+        except Exception as exc:  # noqa: BLE001 - any error becomes errno reply
+            reply = _make_error_reply(exc, "dispatch raised")
+        if reply is None:
+            return
+        if not _send_reply(conn_sock, reply):
+            return
+
+
 def _handle_connection(conn_sock: socket.socket, session: _ServerSession) -> None:
     """Run one client connection synchronously. Returns on EOF.
 
@@ -97,97 +200,15 @@ def _handle_connection(conn_sock: socket.socket, session: _ServerSession) -> Non
             t_enc = time.monotonic()
             encoder_cm = session.spec.encoder_factory(session.reader)
         except Exception as exc:  # noqa: BLE001 - any error becomes errno reply
-            err = encoder_protocol.errno_for_exception(exc)
-            if not isinstance(exc, OSError):
-                logger.error(
-                    "encoder-server encoder construction failed; "
-                    "replying with errno %d: %s",
-                    err,
-                    exc,
-                )
-                logger.debug(
-                    "encoder-server encoder construction traceback",
-                    exc_info=True,
-                )
-            try:
-                conn_sock.sendall(encoder_protocol.pack_error_reply(err))
-            except OSError as send_exc:
-                logger.warning("encoder-server send failed: %s", send_exc)
+            _send_reply(
+                conn_sock, _make_error_reply(exc, "encoder construction failed")
+            )
             return
         with encoder_cm as encoder:
             logger.debug(
                 "%s: encoder created in %.3fs", tname, time.monotonic() - t_enc
             )
-            while True:
-                try:
-                    tag_buf = _recv_exact_sync(conn_sock, 1)
-                except EOFError as exc:
-                    logger.warning("encoder-server frame error: %s", exc)
-                    return
-                if len(tag_buf) == 0:
-                    return
-                tag = bytes(tag_buf)
-                try:
-                    if tag == encoder_protocol.TAG_GET_METADATA:
-                        # Static sidecars are built on demand and dropped
-                        # once serialised: the parent fuse handler holds
-                        # the canonical copy after the handshake.
-                        static_files = session.spec.build_static_files(session.reader)
-                        missing = set(session.spec.static_suffixes) - set(static_files)
-                        extra = set(static_files) - set(session.spec.static_suffixes)
-                        if missing or extra:
-                            raise ValueError(
-                                f"{session.spec.name}: build_static_files "
-                                f"returned keys {sorted(static_files)}; "
-                                f"expected {list(session.spec.static_suffixes)}"
-                            )
-                        ordered_bodies = [
-                            static_files[suffix]
-                            for suffix in session.spec.static_suffixes
-                        ]
-                        reply = encoder_protocol.pack_metadata_reply(
-                            ordered_bodies, session.stream_size
-                        )
-                        del static_files, ordered_bodies
-                    elif tag == encoder_protocol.TAG_READ:
-                        payload = _recv_exact_sync(
-                            conn_sock, encoder_protocol.REQ_READ_PAYLOAD_SIZE
-                        )
-                        if len(payload) < encoder_protocol.REQ_READ_PAYLOAD_SIZE:
-                            return
-                        off, size = encoder_protocol.parse_read_payload(payload)
-                        t_read = time.monotonic()
-                        data = encoder.read(off, size)
-                        logger.debug(
-                            "%s: encoder.read off=%d size=%d in %.3fs",
-                            tname,
-                            off,
-                            size,
-                            time.monotonic() - t_read,
-                        )
-                        reply = encoder_protocol.pack_read_reply(data)
-                    else:
-                        logger.warning(
-                            "encoder-server: unknown tag %r; closing connection",
-                            tag,
-                        )
-                        return
-                except Exception as exc:  # noqa: BLE001 - any error becomes errno reply
-                    err = encoder_protocol.errno_for_exception(exc)
-                    if not isinstance(exc, OSError):
-                        logger.error(
-                            "encoder-server dispatch raised; "
-                            "replying with errno %d: %s",
-                            err,
-                            exc,
-                        )
-                        logger.debug("encoder-server dispatch traceback", exc_info=True)
-                    reply = encoder_protocol.pack_error_reply(err)
-                try:
-                    conn_sock.sendall(reply)
-                except OSError as exc:
-                    logger.warning("encoder-server send failed: %s", exc)
-                    return
+            _serve_connection(conn_sock, session, encoder, tname)
     logger.debug("%s: conn thread exit", tname)
 
 
