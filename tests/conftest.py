@@ -26,7 +26,7 @@ def fx_small_vcz(fx_session_dir) -> helpers.VczFixture:
     """Tiny VCZ: ~10 diploid samples, multiple variant chunks for boundary testing."""
     return helpers.simulate_vcz(
         out_dir=fx_session_dir / "small",
-        num_diploid_samples=10,
+        num_samples=10,
         sequence_length=10_000,
         mutation_rate=1e-3,
         variants_chunk_size=7,
@@ -41,7 +41,7 @@ def fx_medium_vcz(fx_session_dir) -> helpers.VczFixture:
     """Mid-sized VCZ: ~50 diploid samples × hundreds of variants for app tests."""
     return helpers.simulate_vcz(
         out_dir=fx_session_dir / "medium",
-        num_diploid_samples=50,
+        num_samples=50,
         sequence_length=200_000,
         mutation_rate=1e-4,
         variants_chunk_size=50,
@@ -56,7 +56,7 @@ def fx_singleton_vcz(fx_session_dir) -> helpers.VczFixture:
     """Single-variant VCZ. Tiny edge case: chunk count 1, file size minimal."""
     return helpers.simulate_vcz(
         out_dir=fx_session_dir / "singleton",
-        num_diploid_samples=4,
+        num_samples=4,
         sequence_length=1000,
         mutation_rate=2e-3,
         variants_chunk_size=10,
@@ -76,7 +76,7 @@ def fx_multiallelic_vcz(fx_session_dir) -> helpers.VczFixture:
     """
     return helpers.simulate_vcz(
         out_dir=fx_session_dir / "multiallelic",
-        num_diploid_samples=10,
+        num_samples=10,
         sequence_length=10_000,
         mutation_rate=1e-2,
         variants_chunk_size=10,
@@ -84,4 +84,38 @@ def fx_multiallelic_vcz(fx_session_dir) -> helpers.VczFixture:
         name="multiallelic",
         seed=53,
         biallelic=False,
+    )
+
+
+@pytest.fixture(scope="session")
+def fx_haploid_vcz(fx_session_dir) -> helpers.VczFixture:
+    """Tiny haploid VCZ: ``call_genotype`` shape ``(V, S, 1)``."""
+    return helpers.simulate_vcz(
+        out_dir=fx_session_dir / "haploid",
+        num_samples=10,
+        sequence_length=10_000,
+        mutation_rate=1e-3,
+        variants_chunk_size=7,
+        samples_chunk_size=10,
+        name="haploid",
+        seed=67,
+        ploidy=1,
+    )
+
+
+@pytest.fixture(scope="session")
+def fx_mixed_ploidy_vcz(fx_small_vcz, fx_session_dir) -> helpers.VczFixture:
+    """Diploid-shaped VCZ with half the samples flipped to effectively haploid.
+
+    Derived from :func:`fx_small_vcz` by writing ``-2`` into
+    ``call_genotype[:, :S//2, 1]``. The resulting ``call_genotype``
+    still has shape ``(V, S, 2)`` but the BgenEncoder's chunk-level
+    uniform-ploidy check raises ``NotImplementedError`` on the first
+    read, mirroring real X / Y / MT data alongside diploid autosomes.
+    """
+    return helpers.mutate_to_mixed_ploidy(
+        fx_small_vcz.path,
+        fx_session_dir / "mixed_ploidy",
+        name="mixed_ploidy",
+        haploid_sample_fraction=0.5,
     )

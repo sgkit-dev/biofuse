@@ -98,6 +98,27 @@ bgenix -g /tmp/bgen-mnt/sample.bgen -list
 fusermount3 -u /tmp/bgen-mnt
 ```
 
+#### Limitations: ploidy
+
+- **Mixed ploidy is not supported by `mount-bgen`.** The fixed-size BGEN
+  encoder used for random-access serving requires uniform ploidy across
+  every sample and variant in the view. Mounts whose region includes
+  mixed-ploidy chromosomes (typically X, Y, MT) open successfully and
+  serve `.sample` and `.bgen.bgi`, but the first `.bgen` read will fail
+  with `EIO`. Workaround: restrict the view to autosomes at mount time
+  (e.g. via the inherited `-r` / `-R` / `-t` / `-T` region filters), or
+  use the one-shot `vcztools view-bgen` CLI for full-file conversions
+  that include X / Y / MT — `view-bgen` uses the streaming
+  variable-size encoder which handles mixed ploidy correctly.
+- **Pure haploid VCZ is supported by `mount-bgen`** (the encoder emits a
+  uniform-haploid BGEN payload).
+- **`mount-plink` is diploid-only.** Pure haploid VCZ inputs (e.g.
+  mitochondrial-only stores) are rejected by the underlying encoder
+  with `EIO` on the first `.bed` read. Mixed-ploidy VCZ inputs serve
+  successfully, but haploid samples are encoded as homozygous for the
+  called allele — this matches the PLINK 1 BED format, which has no
+  haploid representation.
+
 ## Development
 
 ```bash

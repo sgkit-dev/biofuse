@@ -7,6 +7,8 @@ BGEN reader and compares its output to a side-by-side copy of the
 encoder's bytes.
 """
 
+import contextlib
+import errno
 import os
 import pathlib
 import shutil
@@ -79,6 +81,22 @@ def _encoder_bytes(vcz_path: pathlib.Path) -> bytes:
 
 async def _arun(cmd) -> None:
     await trio.run_process(cmd, capture_stdout=True, capture_stderr=True, check=True)
+
+
+@contextlib.asynccontextmanager
+async def _mount_bgen(tmp_path, vcz):
+    """Mount ``vcz`` as a BGEN fileset; yield ``(mnt, basename)``."""
+    mnt = tmp_path / "mnt"
+    mnt.mkdir()
+    basename = vcz.path.stem
+    sock_path = tmp_path / "bgen.sock"
+    async with await encoder_client.EncoderClient.start(
+        str(vcz.path), sock_path, formats.BGEN_SPEC
+    ) as client:
+        ops = encoder_ops.EncoderOps(client, basename, formats.BGEN_SPEC)
+        async with fuse_adapter.mount(ops, str(mnt)):
+            await _wait_for_mount(mnt)
+            yield mnt, basename
 
 
 class TestBgenBytes:
@@ -205,6 +223,56 @@ class TestStatfs:
         assert info.f_ffree == 0
         assert info.f_files == 3
         assert info.f_namemax >= 255
+
+
+class TestHaploidAndMixedPloidy:
+    """Pins the mount-level behaviour for non-diploid VCZ inputs.
+
+    See ``tests/test_formats.py::TestBgenSpecHaploid`` and
+    ``TestBgenSpecMixedPloidy`` for the encoder-layer contracts these
+    end-to-end tests exercise.
+    """
+
+    async def test_haploid_bgen_matches_encoder(self, tmp_path, fx_haploid_vcz):
+        """Pure haploid is fully supported by BgenEncoder; the mounted
+        ``.bgen`` bytes must match the in-process encoder's output."""
+        expected = _encoder_bytes(fx_haploid_vcz.path)
+        async with _mount_bgen(tmp_path, fx_haploid_vcz) as (mnt, basename):
+            data = await trio.to_thread.run_sync((mnt / f"{basename}.bgen").read_bytes)
+        assert data == expected
+
+    @needs_plink2
+    async def test_haploid_bgen_plink2_freq(self, tmp_path, fx_haploid_vcz):
+        """``plink2 --bgen`` reads the mounted haploid view end-to-end."""
+        async with _mount_bgen(tmp_path, fx_haploid_vcz) as (mnt, basename):
+            out = tmp_path / "p2_freq_hap"
+            await _arun(
+                [
+                    PLINK2,
+                    "--bgen",
+                    str(mnt / f"{basename}.bgen"),
+                    "ref-first",
+                    "--sample",
+                    str(mnt / f"{basename}.sample"),
+                    "--freq",
+                    "--out",
+                    str(out),
+                ]
+            )
+            assert out.with_suffix(".afreq").exists()
+
+    async def test_mixed_ploidy_bgen_read_raises_eio(
+        self, tmp_path, fx_mixed_ploidy_vcz
+    ):
+        """The fixed-size BGEN encoder cannot represent mixed ploidy.
+        The mount and the static sidecars (``.sample``, ``.bgen.bgi``)
+        still serve, but the first ``.bgen`` read fails with EIO."""
+        async with _mount_bgen(tmp_path, fx_mixed_ploidy_vcz) as (mnt, basename):
+            await trio.to_thread.run_sync((mnt / f"{basename}.sample").read_bytes)
+            await trio.to_thread.run_sync((mnt / f"{basename}.bgen.bgi").read_bytes)
+            with pytest.raises(OSError, match="Input/output error") as excinfo:
+                await trio.to_thread.run_sync((mnt / f"{basename}.bgen").read_bytes)
+            assert excinfo.value.errno == errno.EIO
 
 
 class TestAccessTrace:

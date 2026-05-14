@@ -16,6 +16,8 @@ or ``time.sleep`` would block FUSE request servicing and deadlock plink.
 ``trio.run_process`` and ``trio.sleep`` are the trio-native equivalents.
 """
 
+import contextlib
+import errno
 import os
 import pathlib
 import shutil
@@ -23,7 +25,7 @@ import shutil
 import pytest
 import trio
 from vcztools.cli import make_reader
-from vcztools.plink import write_plink
+from vcztools.plink import BedEncoder, write_plink
 
 from biofuse import access_log, encoder_client, encoder_ops, formats, fuse_adapter
 
@@ -81,6 +83,34 @@ async def fx_mounted_plink(tmp_path, fx_medium_vcz):
 
 async def _arun(cmd) -> None:
     await trio.run_process(cmd, capture_stdout=True, capture_stderr=True, check=True)
+
+
+@contextlib.asynccontextmanager
+async def _mount_plink(tmp_path, vcz):
+    """Mount ``vcz`` as a plink fileset; yield ``(mnt, basename)``.
+
+    Skips the ``write_plink`` golden step that :func:`fx_mounted_plink`
+    performs — useful for fixtures where ``write_plink`` would itself
+    fail (e.g. haploid input) or where the test does not need a byte
+    reference.
+    """
+    mnt = tmp_path / "mnt"
+    mnt.mkdir()
+    basename = vcz.path.stem
+    sock_path = tmp_path / "plink.sock"
+    async with await encoder_client.EncoderClient.start(
+        str(vcz.path), sock_path, formats.PLINK_SPEC
+    ) as client:
+        ops = encoder_ops.EncoderOps(client, basename, formats.PLINK_SPEC)
+        async with fuse_adapter.mount(ops, str(mnt)):
+            await _wait_for_mount(mnt)
+            yield mnt, basename
+
+
+def _plink_encoder_bytes(vcz_path: pathlib.Path) -> bytes:
+    reader = make_reader(str(vcz_path))
+    with BedEncoder(reader) as enc:
+        return enc.read(0, enc.total_size)
 
 
 @needs_plink1
@@ -218,6 +248,38 @@ class TestStatfs:
         assert info.f_ffree == 0
         assert info.f_files == 3
         assert info.f_namemax >= 255
+
+
+class TestHaploidAndMixedPloidy:
+    """Pins the mount-level behaviour for non-diploid VCZ inputs.
+
+    See ``tests/test_formats.py::TestPlinkSpecHaploid`` and
+    ``TestPlinkSpecMixedPloidy`` for the encoder-layer contracts these
+    end-to-end tests exercise.
+    """
+
+    async def test_haploid_bed_read_raises_eio(self, tmp_path, fx_haploid_vcz):
+        """Pure haploid VCZ: ``.bim``/``.fam`` serve, but the first
+        ``.bed`` read fails with EIO because vcztools' PLINK C kernel
+        rejects ``ploidy != 2`` outright. The wire protocol surfaces
+        that ``ValueError`` as ``errno.EIO``."""
+        async with _mount_plink(tmp_path, fx_haploid_vcz) as (mnt, basename):
+            await trio.to_thread.run_sync((mnt / f"{basename}.bim").read_bytes)
+            await trio.to_thread.run_sync((mnt / f"{basename}.fam").read_bytes)
+            with pytest.raises(OSError, match="Input/output error") as excinfo:
+                await trio.to_thread.run_sync((mnt / f"{basename}.bed").read_bytes)
+            assert excinfo.value.errno == errno.EIO
+
+    async def test_mixed_ploidy_bed_matches_encoder(
+        self, tmp_path, fx_mixed_ploidy_vcz
+    ):
+        """Diploid-shaped genotype array with -2 in slot 1: PLINK encodes
+        the haploid samples as homozygous (silent-lossy, no error). The
+        mounted ``.bed`` must match the in-process encoder's bytes."""
+        expected = _plink_encoder_bytes(fx_mixed_ploidy_vcz.path)
+        async with _mount_plink(tmp_path, fx_mixed_ploidy_vcz) as (mnt, basename):
+            data = await trio.to_thread.run_sync((mnt / f"{basename}.bed").read_bytes)
+        assert data == expected
 
 
 @needs_plink1
