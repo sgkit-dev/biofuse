@@ -138,12 +138,6 @@ def _spawn_serve_connection(
     return parent_sock, thread
 
 
-class TestServerSession:
-    def test_stream_size_matches_encoder_total_size(self, fx_session, fx_expected):
-        _, _, expected_stream_size = fx_expected
-        assert fx_session.stream_size == expected_stream_size
-
-
 class TestMakeErrorReply:
     def test_oserror_uses_exc_errno_without_logging(self, caplog):
         exc = OSError(errno.ENOENT, "missing")
@@ -362,7 +356,7 @@ class TestServeConnection:
 
 class TestHandleConnectionMetadata:
     def test_get_metadata_returns_full_static(self, fx_session, fx_expected):
-        spec, expected_static, _ = fx_expected
+        spec, expected_static, expected_stream_size = fx_expected
         parent, thread = _spawn_handle_connection(fx_session)
         try:
             parent.sendall(encoder_protocol.pack_get_metadata_request())
@@ -380,7 +374,7 @@ class TestHandleConnectionMetadata:
                 body[: encoder_protocol.META_PREFIX_SIZE]
             )
             assert got_n_static == n_static
-            assert got_stream_size == fx_session.stream_size
+            assert got_stream_size == expected_stream_size
             sizes_start = encoder_protocol.META_PREFIX_SIZE
             sizes_end = sizes_start + sizes_size
             sizes = encoder_protocol.parse_static_sizes(
@@ -404,28 +398,29 @@ class TestHandleConnectionMetadata:
 
 
 class TestHandleConnectionRead:
-    def test_full_stream_read_matches_session_size(self, fx_session):
-        """The encoder's full byte stream matches ``stream_size``.
+    def test_full_stream_read_matches_session_size(self, fx_session, fx_expected):
+        """The encoder's full byte stream matches the expected
+        ``total_size``.
 
         We do not byte-compare against the on-disk golden here: for
         BGEN the on-disk file and the encoder both emit level-0 blocks
         with the same fixed layout, but a parametric byte-compare
         belongs in the apps suite. This test pins that the read loop
-        reaches EOF exactly at ``stream_size``.
+        reaches EOF exactly at the expected stream size.
         """
+        _, _, expected_stream_size = fx_expected
         parent, thread = _spawn_handle_connection(fx_session)
         try:
-            parent.sendall(
-                encoder_protocol.pack_read_request(0, fx_session.stream_size)
-            )
+            parent.sendall(encoder_protocol.pack_read_request(0, expected_stream_size))
             status, body = _read_status_and_body(parent)
-            assert status == fx_session.stream_size
-            assert len(body) == fx_session.stream_size
+            assert status == expected_stream_size
+            assert len(body) == expected_stream_size
         finally:
             parent.close()
             thread.join(timeout=5)
 
-    def test_chunked_read(self, fx_session):
+    def test_chunked_read(self, fx_session, fx_expected):
+        _, _, expected_stream_size = fx_expected
         parent, thread = _spawn_handle_connection(fx_session)
         try:
             chunks = []
@@ -438,7 +433,7 @@ class TestHandleConnectionRead:
                     break
                 chunks.append(body)
                 offset += len(body)
-            assert sum(len(c) for c in chunks) == fx_session.stream_size
+            assert sum(len(c) for c in chunks) == expected_stream_size
         finally:
             parent.close()
             thread.join(timeout=5)
@@ -588,10 +583,13 @@ class TestServeForever:
             server_thread.join(timeout=5)
             assert not server_thread.is_alive()
 
-    def test_concurrent_stream_reads_independent_state(self, fx_session, tmp_path):
+    def test_concurrent_stream_reads_independent_state(
+        self, fx_session, fx_expected, tmp_path
+    ):
         """Each connection runs in its own server thread with its own
         encoder; full reads on distinct connections see byte-identical
         streams regardless of interleaving."""
+        _, _, expected_stream_size = fx_expected
         listener, sock_path = self._bind_listener(tmp_path)
         parent_stop, server_thread = self._start_server_thread(listener, fx_session)
         try:
@@ -608,9 +606,7 @@ class TestServeForever:
                     try:
                         barrier.wait(timeout=5)
                         s.sendall(
-                            encoder_protocol.pack_read_request(
-                                0, fx_session.stream_size
-                            )
+                            encoder_protocol.pack_read_request(0, expected_stream_size)
                         )
                         _, body = _read_status_and_body(s)
                         with lock:
@@ -629,7 +625,7 @@ class TestServeForever:
             assert errors == []
             assert len(results) == n
             reference = results[0]
-            assert len(reference) == fx_session.stream_size
+            assert len(reference) == expected_stream_size
             for body in results.values():
                 assert body == reference
         finally:

@@ -37,13 +37,13 @@ logger = logging.getLogger(__name__)
 class _ServerSession:
     """Server-side state shared across all connection threads.
 
-    Holds the ``VczReader``, the active format spec, and the
-    streaming-file size. The static sidecar bytes are built on demand
-    inside the metadata handshake (see ``_handle_connection``) rather
-    than cached here — the parent fuse handler is the canonical owner
-    of those bytes after the handshake completes. Immutable after
-    construction; safe to read concurrently from any thread without
-    locking.
+    Holds the ``VczReader`` and the active format spec. The static
+    sidecar bytes and the streaming-file size are both built on demand
+    inside the metadata handshake (see ``_make_metadata_reply``)
+    rather than cached here — the parent fuse handler is the canonical
+    owner of that metadata after the handshake completes. Immutable
+    after construction; safe to read concurrently from any thread
+    without locking.
     """
 
     def __init__(
@@ -53,11 +53,6 @@ class _ServerSession:
     ) -> None:
         self.reader = reader
         self.spec = spec
-        # Open one throwaway encoder to read ``total_size`` — encoder
-        # construction is I/O-free, so this is cheap. Per-connection
-        # encoders are constructed fresh in ``_handle_connection``.
-        with spec.encoder_factory(reader) as encoder:
-            self.stream_size: int = int(encoder.total_size)
 
 
 def _recv_exact_sync(sock: socket.socket, n: int) -> bytes:
@@ -98,9 +93,11 @@ def _make_error_reply(exc: BaseException, context: str) -> bytes:
 def _make_metadata_reply(session: "_ServerSession") -> bytes:
     """Build the reply for a ``TAG_GET_METADATA`` request.
 
-    The static sidecars are built on demand from the format spec,
-    serialised into the reply, then dropped: the parent fuse handler
-    owns the canonical copy after the handshake.
+    The static sidecars and the streaming-file size are built on
+    demand from the format spec, serialised into the reply, then
+    dropped: the parent fuse handler owns the canonical copy after
+    the handshake. Encoder construction is I/O-free so reading
+    ``total_size`` here is cheap.
     """
     static_files = session.spec.build_static_files(session.reader)
     missing = set(session.spec.static_suffixes) - set(static_files)
@@ -110,8 +107,10 @@ def _make_metadata_reply(session: "_ServerSession") -> bytes:
             f"{session.spec.name}: build_static_files returned keys "
             f"{sorted(static_files)}; expected {list(session.spec.static_suffixes)}"
         )
+    with session.spec.encoder_factory(session.reader) as encoder:
+        stream_size = int(encoder.total_size)
     ordered_bodies = [static_files[suffix] for suffix in session.spec.static_suffixes]
-    return encoder_protocol.pack_metadata_reply(ordered_bodies, session.stream_size)
+    return encoder_protocol.pack_metadata_reply(ordered_bodies, stream_size)
 
 
 def _make_read_reply(conn_sock: socket.socket, encoder, tname: str) -> bytes | None:
