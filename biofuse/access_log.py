@@ -94,8 +94,8 @@ class AccessLogger:
         t_end: float | None = None,
     ) -> None:
         """Record a non-read lifecycle event (open / release / limiter_wait /
-        aclose). ``offset`` and ``size`` are zero for these events; the
-        ``[t_start, t_end]`` interval is what matters."""
+        limiter_timeout / aclose). ``offset`` and ``size`` are zero for
+        these events; the ``[t_start, t_end]`` interval is what matters."""
         if t_end is None:
             t_end = time.monotonic()
         self._write(

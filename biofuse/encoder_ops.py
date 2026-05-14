@@ -45,7 +45,9 @@ _DEFAULT_MAX_OPEN_STREAM = 16
 # Maximum time a FUSE_OPEN may wait at the per-mount streaming-file
 # capacity limiter. On expiry the open returns ``EAGAIN`` to the kernel
 # rather than blocking forever — this guards against a leaked limiter
-# slot permanently wedging open().
+# slot permanently wedging open(). The timeout is also recorded in the
+# access log as a ``limiter_timeout`` event so a post-hoc trace can
+# tell EAGAIN-from-limiter from any other EAGAIN.
 _LIMITER_TIMEOUT_S = 30.0
 
 _STATIC_KIND = "static"
@@ -222,6 +224,9 @@ class EncoderOps(pyfuse3.Operations):
                 await self._stream_limiter.acquire_on_behalf_of(fh)
             t_limiter_end = time.monotonic()
             if cs.cancelled_caught:
+                self._record_event(
+                    "limiter_timeout", name, fh, t_limiter_start, t_limiter_end
+                )
                 raise pyfuse3.FUSEError(errno.EAGAIN)
             self._record_event("limiter_wait", name, fh, t_limiter_start, t_limiter_end)
             try:
