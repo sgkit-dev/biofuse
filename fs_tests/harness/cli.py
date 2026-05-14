@@ -12,6 +12,7 @@ from . import (
     fio_runner,
     fsx_runner,
     lifecycle,
+    liveness,
     pjdfstest,
     posix,
     report,
@@ -240,6 +241,25 @@ def lifecycle_cmd(ctx: click.Context, iterations: int) -> None:
     sys.exit(_emit(results_dir, [result]))
 
 
+@main.command("active-under-stress")
+@click.option(
+    "--duration",
+    type=float,
+    default=liveness.DEFAULT_DURATION_S,
+    help="Background fio stress duration in seconds.",
+)
+@click.pass_context
+def active_under_stress_cmd(ctx: click.Context, duration: float) -> None:
+    """Run mount-liveness probes while a background fio stressor is active."""
+    results_dir = ctx.obj["results_dir"]
+    log_dir = _runner_log_dir(results_dir, "active-under-stress")
+    result = _run_with_banner(
+        "active-under-stress",
+        lambda: liveness.run(log_dir=log_dir, duration_s=duration),
+    )
+    sys.exit(_emit(results_dir, [result]))
+
+
 @main.command("all")
 @click.pass_context
 def all_cmd(ctx: click.Context) -> None:
@@ -254,6 +274,7 @@ def all_cmd(ctx: click.Context) -> None:
     fsx_log_dir = _runner_log_dir(results_dir, "fsx")
     stress_log_dir = _runner_log_dir(results_dir, "stress-ng")
     lifecycle_log_dir = _runner_log_dir(results_dir, "lifecycle")
+    liveness_log_dir = _runner_log_dir(results_dir, "active-under-stress")
 
     results: list[tools.RunnerResult] = [
         _run_with_banner("posix", lambda: posix.run(log_path=posix_log))
@@ -281,5 +302,12 @@ def all_cmd(ctx: click.Context) -> None:
     results.append(
         _run_with_banner("lifecycle", lambda: lifecycle.run(log_dir=lifecycle_log_dir))
     )
+    if not quick:
+        results.append(
+            _run_with_banner(
+                "active-under-stress",
+                lambda: liveness.run(log_dir=liveness_log_dir),
+            )
+        )
 
     sys.exit(_emit(results_dir, results))

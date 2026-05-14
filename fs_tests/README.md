@@ -10,10 +10,11 @@ every PR.
 |---|---|---|
 | POSIX syscall semantics | native Python | ~10 s |
 | pjdfstest curated subset | external (`pjdfstest`) | ~30–60 s |
-| Read-pattern stress | external (`fio`) | ~3 min |
+| Read-pattern stress | external (`fio`) | ~4 min |
 | Read cross-validation | native Python (fsx-style) | ~30 s |
 | Filesystem stressor | external (`stress-ng`) | ~2 min |
 | Mount/unmount cycling | native Python | ~2 min |
+| Active under stress | external (`fio`) + native probes | ~30 s |
 | **Total** | | **~10–15 min** |
 
 Every category mounts biofuse fresh in a subprocess (matching real-user
@@ -44,10 +45,11 @@ uv sync --group fs-tests
 Run from the repository root:
 
 ```bash
-uv run --group fs-tests python -m fs_tests.harness                  # all categories
-uv run --group fs-tests python -m fs_tests.harness --quick          # smoke run (skips pjdfstest + large fio)
-uv run --group fs-tests python -m fs_tests.harness posix            # one category
-uv run --group fs-tests python -m fs_tests.harness fio --large      # fio with the 500 MB fixture
+uv run --group fs-tests python -m fs_tests.harness                          # all categories
+uv run --group fs-tests python -m fs_tests.harness --quick                  # smoke run (skips pjdfstest, fio, active-under-stress)
+uv run --group fs-tests python -m fs_tests.harness posix                    # one category
+uv run --group fs-tests python -m fs_tests.harness fio --large              # fio with the 500 MB fixture
+uv run --group fs-tests python -m fs_tests.harness active-under-stress      # liveness probes under background fio
 uv run --group fs-tests python -m fs_tests.harness --results /tmp/biofuse-results all
 ```
 
@@ -90,6 +92,28 @@ completes with zero errors.
 errors" reported by fio. Throughput numbers are recorded in `report.md`
 for tracking but do not gate on a floor — they depend heavily on the
 host (page cache, CPU, fixture size).
+
+**fio gating: streaming vs. static targets.** The fio runner classifies
+each job in `harness/fio_runner.py`:
+
+- Gated streaming jobs against `.bed`: `seq-read`, `rand-read`,
+  `mmap-read`, `parallel-seq-read` (numjobs=4 sequential). Errors here
+  fail the runner.
+- Informational streaming job: `multithread` (numjobs=16, random) is
+  expected to time out under FUSE backpressure (the kernel returns
+  EAGAIN); its errors are recorded in the detail line but do not gate
+  the run. The concurrency-overlap check it drives is still gated.
+- Gated static-file jobs: `static-stress-bim` / `static-stress-fam`
+  hammer the in-memory cached `.bim` and `.fam` files with
+  `numjobs=16` random reads. These must always pass.
+
+**Active under stress.** A separate runner (`active-under-stress`)
+spawns the multithread fio job in the background against `.bed`, then
+loops foreground probes — `readdir` plus 4 KB reads of `.bim` and
+`.fam` — with a per-probe timeout (default 5 s). It exists to confirm
+that mount-level operations and static-file reads stay responsive even
+while the streaming file is saturated. The streaming file itself is
+*not* probed: that is the load.
 
 **fsx is read-only mode only.** Apple/LTP/xfstests fsx all assume a
 writable filesystem (they bootstrap the in-memory model by writing to
