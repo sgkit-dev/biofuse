@@ -344,22 +344,25 @@ class TestRealSubprocess:
     @pytest.mark.parametrize(
         "spec", [formats.PLINK_SPEC, formats.BGEN_SPEC], ids=["plink", "bgen"]
     )
-    async def test_start_fast_fails_on_subprocess_startup_error(
+    async def test_start_fast_fails_on_handshake_build_error(
         self, fx_multiallelic_vcz, tmp_path, spec
     ):
         """``EncoderClient.start()`` must surface a clean ``OSError`` and
         return well under the 10 s connect deadline when the subprocess
-        catches a startup error (here: multi-allelic VCZ) and exits."""
+        rejects the input during the metadata handshake. Static-file
+        build (here: multi-allelic VCZ) runs on demand inside
+        ``_handle_connection``; failures become errno replies on the
+        handshake socket."""
         socket_path = tmp_path / "encoder.sock"
         t0 = trio.current_time()
-        with pytest.raises(OSError, match="exited during startup") as excinfo:
+        with pytest.raises(OSError, match="encoder-server reported errno") as excinfo:
             await encoder_client.EncoderClient.start(
                 str(fx_multiallelic_vcz.path), socket_path, spec
             )
         elapsed = trio.current_time() - t0
         assert excinfo.value.errno == errno.EIO
         assert elapsed < encoder_client._CONNECT_DEADLINE_S, (
-            f"start() should fast-fail when child dies, took {elapsed:.2f}s"
+            f"start() should fast-fail on handshake error, took {elapsed:.2f}s"
         )
 
     async def test_max_alleles_filter_through_start(

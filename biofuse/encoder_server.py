@@ -5,9 +5,9 @@ requests for one output format (PLINK 1 binary / Oxford BGEN) over an
 ``AF_UNIX`` listening socket. The owning :class:`~biofuse.formats.FormatSpec`
 selects:
 
-- which static sidecar files to precompute and cache (``.bim``/``.fam``
-  for PLINK; ``.sample``/``.bgen.bgi`` for BGEN), via
-  :meth:`FormatSpec.build_static_files`;
+- which static sidecar files to build on demand for the metadata
+  handshake (``.bim``/``.fam`` for PLINK; ``.sample``/``.bgen.bgi``
+  for BGEN), via :meth:`FormatSpec.build_static_files`;
 - which encoder class to construct per accepted connection, via
   :meth:`FormatSpec.encoder_factory`.
 
@@ -37,10 +37,13 @@ logger = logging.getLogger(__name__)
 class _ServerSession:
     """Server-side state shared across all connection threads.
 
-    Holds the ``VczReader``, the precomputed static-file bodies (in
-    the format spec's declared order), and the streaming-file size.
-    Immutable after construction; safe to read concurrently from any
-    thread without locking.
+    Holds the ``VczReader``, the active format spec, and the
+    streaming-file size. The static sidecar bytes are built on demand
+    inside the metadata handshake (see ``_handle_connection``) rather
+    than cached here — the parent fuse handler is the canonical owner
+    of those bytes after the handshake completes. Immutable after
+    construction; safe to read concurrently from any thread without
+    locking.
     """
 
     def __init__(
@@ -50,14 +53,6 @@ class _ServerSession:
     ) -> None:
         self.reader = reader
         self.spec = spec
-        self.static_files: dict[str, bytes] = spec.build_static_files(reader)
-        missing = set(spec.static_suffixes) - set(self.static_files)
-        extra = set(self.static_files) - set(spec.static_suffixes)
-        if missing or extra:
-            raise ValueError(
-                f"{spec.name}: build_static_files returned keys "
-                f"{sorted(self.static_files)}; expected {list(spec.static_suffixes)}"
-            )
         # Open one throwaway encoder to read ``total_size`` — encoder
         # construction is I/O-free, so this is cheap. Per-connection
         # encoders are constructed fresh in ``_handle_connection``.
@@ -104,8 +99,15 @@ def _handle_connection(conn_sock: socket.socket, session: _ServerSession) -> Non
         except Exception as exc:  # noqa: BLE001 - any error becomes errno reply
             err = encoder_protocol.errno_for_exception(exc)
             if not isinstance(exc, OSError):
-                logger.exception(
-                    "encoder-server encoder construction failed; replying with errno"
+                logger.error(
+                    "encoder-server encoder construction failed; "
+                    "replying with errno %d: %s",
+                    err,
+                    exc,
+                )
+                logger.debug(
+                    "encoder-server encoder construction traceback",
+                    exc_info=True,
                 )
             try:
                 conn_sock.sendall(encoder_protocol.pack_error_reply(err))
@@ -127,13 +129,26 @@ def _handle_connection(conn_sock: socket.socket, session: _ServerSession) -> Non
                 tag = bytes(tag_buf)
                 try:
                     if tag == encoder_protocol.TAG_GET_METADATA:
+                        # Static sidecars are built on demand and dropped
+                        # once serialised: the parent fuse handler holds
+                        # the canonical copy after the handshake.
+                        static_files = session.spec.build_static_files(session.reader)
+                        missing = set(session.spec.static_suffixes) - set(static_files)
+                        extra = set(static_files) - set(session.spec.static_suffixes)
+                        if missing or extra:
+                            raise ValueError(
+                                f"{session.spec.name}: build_static_files "
+                                f"returned keys {sorted(static_files)}; "
+                                f"expected {list(session.spec.static_suffixes)}"
+                            )
                         ordered_bodies = [
-                            session.static_files[suffix]
+                            static_files[suffix]
                             for suffix in session.spec.static_suffixes
                         ]
                         reply = encoder_protocol.pack_metadata_reply(
                             ordered_bodies, session.stream_size
                         )
+                        del static_files, ordered_bodies
                     elif tag == encoder_protocol.TAG_READ:
                         payload = _recv_exact_sync(
                             conn_sock, encoder_protocol.REQ_READ_PAYLOAD_SIZE
@@ -160,9 +175,13 @@ def _handle_connection(conn_sock: socket.socket, session: _ServerSession) -> Non
                 except Exception as exc:  # noqa: BLE001 - any error becomes errno reply
                     err = encoder_protocol.errno_for_exception(exc)
                     if not isinstance(exc, OSError):
-                        logger.exception(
-                            "encoder-server dispatch raised; replying with EIO"
+                        logger.error(
+                            "encoder-server dispatch raised; "
+                            "replying with errno %d: %s",
+                            err,
+                            exc,
                         )
+                        logger.debug("encoder-server dispatch traceback", exc_info=True)
                     reply = encoder_protocol.pack_error_reply(err)
                 try:
                     conn_sock.sendall(reply)
@@ -253,12 +272,15 @@ def _server_main(
     ``make_reader`` consumes.
 
     Any exception raised before ``serve_forever`` starts (reader
-    construction, ``_ServerSession`` construction — the latter eagerly
-    walks the variants to build the static sidecars and may reject e.g.
-    multi-allelic input) is caught here so multiprocessing's default
-    handler does not print a traceback. The cause is logged at ERROR
-    (visible at default verbosity); the traceback only surfaces at
-    DEBUG.
+    construction, ``_ServerSession`` construction) is caught here so
+    multiprocessing's default handler does not print a traceback. The
+    cause is logged at ERROR (visible at default verbosity); the
+    traceback only surfaces at DEBUG. Static-sidecar build errors
+    (e.g. multi-allelic input rejection) now surface inside
+    ``_handle_connection`` on the first metadata request rather than
+    at session construction; the handler converts them to errno
+    replies so the parent sees a clean ``OSError`` from
+    ``_handshake``.
     """
     log_config.apply()
     try:

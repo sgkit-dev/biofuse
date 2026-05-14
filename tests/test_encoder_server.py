@@ -96,16 +96,6 @@ def _spawn_handle_connection(
 
 
 class TestServerSession:
-    def test_static_files_match_spec_output(self, fx_session, fx_expected):
-        _, expected_static, _ = fx_expected
-        assert set(fx_session.static_files) == set(expected_static)
-        for suffix in expected_static:
-            # ``.bgi`` SQLite bytes can differ across independent writes
-            # in non-payload header fields, so compare sizes rather than
-            # bytes for the .bgi entry; per-byte parity is covered in
-            # the apps suite by reading via the live mount.
-            assert len(fx_session.static_files[suffix]) == len(expected_static[suffix])
-
     def test_stream_size_matches_encoder_total_size(self, fx_session, fx_expected):
         _, _, expected_stream_size = fx_expected
         assert fx_session.stream_size == expected_stream_size
@@ -113,7 +103,7 @@ class TestServerSession:
 
 class TestHandleConnectionMetadata:
     def test_get_metadata_returns_full_static(self, fx_session, fx_expected):
-        spec, _, _ = fx_expected
+        spec, expected_static, _ = fx_expected
         parent, thread = _spawn_handle_connection(fx_session)
         try:
             parent.sendall(encoder_protocol.pack_get_metadata_request())
@@ -121,7 +111,7 @@ class TestHandleConnectionMetadata:
             n_static = len(spec.static_suffixes)
             sizes_size = n_static * encoder_protocol.META_SIZE_ENTRY_SIZE
             static_sizes = [
-                len(fx_session.static_files[suffix]) for suffix in spec.static_suffixes
+                len(expected_static[suffix]) for suffix in spec.static_suffixes
             ]
             expected_body_size = (
                 encoder_protocol.META_PREFIX_SIZE + sizes_size + sum(static_sizes)
@@ -140,7 +130,13 @@ class TestHandleConnectionMetadata:
             assert sizes == tuple(static_sizes)
             offset = sizes_end
             for suffix, size in zip(spec.static_suffixes, sizes, strict=True):
-                assert body[offset : offset + size] == fx_session.static_files[suffix]
+                assert size == len(expected_static[suffix])
+                # ``.bgi`` SQLite bytes can differ across independent writes
+                # in non-payload header fields, so compare sizes only for
+                # the .bgi entry; per-byte parity is covered in the apps
+                # suite by reading via the live mount.
+                if suffix != ".bgen.bgi":
+                    assert body[offset : offset + size] == expected_static[suffix]
                 offset += size
         finally:
             parent.close()
@@ -396,16 +392,16 @@ class TestServeForever:
             s.connect(str(sock_path))
 
 
-class TestServerMainStartupFailure:
-    """``_server_main`` must catch its own startup exceptions so the
-    multiprocessing subprocess exits cleanly (no Python traceback printed
-    to stderr) when the VCZ cannot be served — e.g. multi-allelic
-    input."""
+class TestServerMainHandshakeFailure:
+    """Static-file build failures (e.g. multi-allelic input) surface at
+    handshake time as errno replies on the wire. The subprocess must
+    keep running through a failed handshake and exit cleanly when
+    stop-signalled."""
 
     @pytest.mark.parametrize(
         "spec", [formats.PLINK_SPEC, formats.BGEN_SPEC], ids=["plink", "bgen"]
     )
-    def test_multiallelic_subprocess_exits_cleanly(
+    def test_multiallelic_handshake_returns_errno(
         self, fx_multiallelic_vcz, tmp_path, spec
     ):
         sock_path = tmp_path / "encoder.sock"
@@ -428,20 +424,35 @@ class TestServerMainStartupFailure:
         proc.start()
         listener.close()
         child_stop.close()
+        parent_stop_closed = False
         try:
-            proc.join(timeout=30)
-            assert not proc.is_alive(), "subprocess did not exit"
-            assert proc.exitcode == 0, (
-                f"subprocess exited with {proc.exitcode}; expected 0 "
-                "(_server_main should catch startup errors and return)"
-            )
             client_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            client_sock.settimeout(1)
-            with pytest.raises((ConnectionRefusedError, FileNotFoundError)):
-                client_sock.connect(str(sock_path))
+            client_sock.settimeout(30)
+            deadline = time.monotonic() + 10.0
+            while True:
+                try:
+                    client_sock.connect(str(sock_path))
+                    break
+                except (FileNotFoundError, ConnectionRefusedError):
+                    if time.monotonic() > deadline:
+                        raise
+                    time.sleep(0.05)
+            client_sock.sendall(encoder_protocol.pack_get_metadata_request())
+            status_buf = _recv_exact(client_sock, encoder_protocol.REPLY_STATUS_SIZE)
+            status = encoder_protocol.parse_status(status_buf)
+            assert status < 0, f"expected errno reply, got status={status}"
+            assert -status == errno.EIO
             client_sock.close()
-        finally:
             parent_stop.close()
+            parent_stop_closed = True
+            proc.join(timeout=10)
+            assert not proc.is_alive(), "subprocess did not exit after stop signal"
+            assert proc.exitcode == 0, (
+                f"subprocess exited with {proc.exitcode}; expected 0"
+            )
+        finally:
+            if not parent_stop_closed:
+                parent_stop.close()
             if proc.is_alive():
                 proc.terminate()
                 proc.join(timeout=5)
