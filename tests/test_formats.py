@@ -6,7 +6,6 @@ shared :class:`VczReader`, and each ``encoder_factory`` yields an
 encoder whose ``total_size`` reflects the same selection.
 """
 
-import pathlib
 import sqlite3
 import tempfile
 
@@ -91,12 +90,11 @@ class TestBgenSpec:
             "size_in_bytes",
         } <= columns
 
-    def test_tempfile_cleaned_up(self, fx_reader):
-        tmpdir = pathlib.Path(tempfile.gettempdir())
-        before = {p.name for p in tmpdir.glob("biofuse-bgen-*")}
+    def test_tempfile_cleaned_up(self, fx_reader, tmp_path, monkeypatch):
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
         formats.BGEN_SPEC.build_static_files(fx_reader)
-        after = {p.name for p in tmpdir.glob("biofuse-bgen-*")}
-        assert after == before, f"left behind: {after - before}"
+        leftovers = list(tmp_path.glob("biofuse-bgen-*"))
+        assert leftovers == [], f"left behind: {leftovers}"
 
     def test_encoder_total_size_is_fixed_size_layout(self, fx_reader):
         with formats.BGEN_SPEC.encoder_factory(fx_reader) as encoder:
