@@ -21,7 +21,7 @@ CACHE_DIR = pathlib.Path(__file__).resolve().parent.parent / ".cache"
 @dataclasses.dataclass(frozen=True)
 class FixtureSpec:
     name: str
-    num_diploid_samples: int
+    num_samples: int
     sequence_length: int
     mutation_rate: float
     variants_chunk_size: int
@@ -37,7 +37,7 @@ class FixtureSpec:
 
 SMALL = FixtureSpec(
     name="small",
-    num_diploid_samples=10,
+    num_samples=10,
     sequence_length=10_000,
     mutation_rate=1e-3,
     variants_chunk_size=7,
@@ -47,7 +47,7 @@ SMALL = FixtureSpec(
 
 MEDIUM = FixtureSpec(
     name="medium",
-    num_diploid_samples=200,
+    num_samples=200,
     sequence_length=10_000_000,
     mutation_rate=1e-3,
     variants_chunk_size=1000,
@@ -57,7 +57,7 @@ MEDIUM = FixtureSpec(
 
 LARGE = FixtureSpec(
     name="large",
-    num_diploid_samples=500,
+    num_samples=500,
     sequence_length=20_000_000,
     mutation_rate=2e-3,
     variants_chunk_size=2000,
@@ -81,7 +81,7 @@ def get_or_build(
         "building fixture %s under %s (samples=%d seq_len=%d mut_rate=%g)",
         spec.name,
         spec_dir,
-        spec.num_diploid_samples,
+        spec.num_samples,
         spec.sequence_length,
         spec.mutation_rate,
     )
@@ -90,7 +90,7 @@ def get_or_build(
     build_started = time.monotonic()
     fixture = helpers.simulate_vcz(
         out_dir=spec_dir,
-        num_diploid_samples=spec.num_diploid_samples,
+        num_samples=spec.num_samples,
         sequence_length=spec.sequence_length,
         mutation_rate=spec.mutation_rate,
         variants_chunk_size=spec.variants_chunk_size,

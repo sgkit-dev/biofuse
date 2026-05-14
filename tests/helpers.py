@@ -1,6 +1,7 @@
 """Test helpers shared across the biofuse test suite."""
 
 import pathlib
+import shutil
 from dataclasses import dataclass
 
 import bio2zarr.tskit as bio2zarr_tskit
@@ -61,7 +62,7 @@ def _keep_first_mutation_per_site(ts):
 def simulate_vcz(
     out_dir: pathlib.Path,
     *,
-    num_diploid_samples: int,
+    num_samples: int,
     sequence_length: float,
     mutation_rate: float,
     variants_chunk_size: int,
@@ -69,6 +70,7 @@ def simulate_vcz(
     name: str = "sim",
     seed: int = 1,
     biallelic: bool = True,
+    ploidy: int = 2,
 ) -> VczFixture:
     """Simulate a tree sequence and convert it to VCZ on disk.
 
@@ -76,10 +78,13 @@ def simulate_vcz(
     owns cleanup of out_dir. By default the fixture is biallelic: any
     site with multiple mutations keeps only its first mutation. Pass
     ``biallelic=False`` to keep recurrent mutations and exercise the
-    multi-allelic rejection path.
+    multi-allelic rejection path. ``ploidy=1`` yields a VCZ with
+    ``call_genotype`` of shape ``(V, num_samples, 1)``; the default
+    ``ploidy=2`` yields ``(V, num_samples, 2)``.
     """
     ts = msprime.sim_ancestry(
-        samples=num_diploid_samples,
+        samples=num_samples,
+        ploidy=ploidy,
         sequence_length=sequence_length,
         recombination_rate=1e-8,
         random_seed=seed,
@@ -102,7 +107,6 @@ def simulate_vcz(
     )
 
     num_variants = ts.num_sites
-    num_samples = ts.num_samples // 2
     return VczFixture(
         path=vcz_path,
         num_samples=num_samples,
@@ -110,4 +114,42 @@ def simulate_vcz(
         num_biallelic_sites=_count_biallelic_sites(vcz_path),
         variants_chunk_size=variants_chunk_size,
         samples_chunk_size=samples_chunk_size,
+    )
+
+
+def mutate_to_mixed_ploidy(
+    src_vcz: pathlib.Path,
+    dst_dir: pathlib.Path,
+    *,
+    name: str = "mixed",
+    haploid_sample_fraction: float = 0.5,
+) -> VczFixture:
+    """Copy a diploid VCZ and convert half its samples to effectively haploid.
+
+    Writes the haploid sentinel ``-2`` into slot 1 of ``call_genotype`` for
+    the first ``int(S * haploid_sample_fraction)`` samples across all
+    variants. This is the canonical VCZ representation for samples with
+    lower ploidy within a fixed-width genotype array — it is what an X /
+    Y / MT chromosome looks like alongside diploid autosomes in the same
+    store.
+    """
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst_vcz = dst_dir / f"{name}.vcz"
+    shutil.copytree(src_vcz, dst_vcz)
+
+    store = zarr.open(dst_vcz, mode="r+")
+    call_genotype = store["call_genotype"]
+    num_variants, num_samples, _ = call_genotype.shape
+    num_haploid = int(num_samples * haploid_sample_fraction)
+    arr = call_genotype[:]
+    arr[:, :num_haploid, 1] = -2
+    call_genotype[:] = arr
+
+    return VczFixture(
+        path=dst_vcz,
+        num_samples=num_samples,
+        num_variants=num_variants,
+        num_biallelic_sites=_count_biallelic_sites(dst_vcz),
+        variants_chunk_size=call_genotype.chunks[0],
+        samples_chunk_size=call_genotype.chunks[1],
     )
