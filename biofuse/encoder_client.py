@@ -201,14 +201,17 @@ class EncoderClient:
         try:
             await self._handshake()
         except BaseException as exc:
+            # If the subprocess has exited on its own during startup
+            # the handshake failure is a downstream symptom (refused
+            # connect, RST mid frame, premature EOF). Surface a single
+            # clean OSError so the CLI prints one error line and
+            # points the user at the server's own log. Check
+            # ``is_alive`` before ``aclose`` — the latter signals stop
+            # and joins the child, after which ``exitcode`` is set
+            # regardless of why the child exited.
+            child_died_on_own = not proc.is_alive()
             await self.aclose()
-            # If the subprocess has exited during startup the handshake
-            # failure is a downstream symptom (refused connect, RST mid
-            # frame, premature EOF). Surface a single clean OSError so
-            # the CLI prints one error line and points the user at the
-            # server's own log, instead of leaking the trio / socket
-            # exception type to the caller.
-            if proc.exitcode is not None and not isinstance(exc, KeyboardInterrupt):
+            if child_died_on_own and not isinstance(exc, KeyboardInterrupt):
                 raise OSError(
                     errno.EIO,
                     f"{spec.name}-server exited during startup; "

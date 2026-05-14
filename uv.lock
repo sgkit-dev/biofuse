@@ -1737,8 +1737,8 @@ all = [
 
 [[package]]
 name = "vcztools"
-version = "0.1.3.dev295"
-source = { git = "https://github.com/sgkit-dev/vcztools.git?rev=main#07bac4420d54b1c21ccf37b2d1da39a25ab4acb3" }
+version = "0.1.3.dev305"
+source = { git = "https://github.com/sgkit-dev/vcztools.git?rev=main#f5c306a12c5907c140227cef61f4f6651636dd14" }
 dependencies = [
     { name = "click" },
     { name = "humanfriendly" },
