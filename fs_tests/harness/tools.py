@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import time
 
-from vcztools.cli import make_reader
+import vcztools
 from vcztools.plink import write_plink
 
 logger = logging.getLogger(__name__)
@@ -98,5 +98,6 @@ def materialise_plink_oracle(
     if bed_path.exists():
         return bed_path
     logger.info("materialising plink oracle at %s", dest_dir / basename)
-    write_plink(make_reader(str(vcz_path)), dest_dir / basename)
+    reader = vcztools.ViewPlinkOptions().make_reader(str(vcz_path))
+    write_plink(reader, dest_dir / basename)
     return bed_path

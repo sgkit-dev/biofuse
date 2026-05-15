@@ -9,7 +9,7 @@ from functools import wraps
 
 import click
 import trio
-from vcztools import cli as vcztools_cli
+import vcztools
 
 from biofuse import access_log, encoder_client, encoder_ops, formats, fuse_adapter
 
@@ -70,9 +70,8 @@ def biofuse_main():
     type=click.Path(file_okay=False, dir_okay=True, path_type=str),
 )
 @_basename_opt("plink")
-@vcztools_cli.view_plink_options
+@vcztools.ViewPlinkOptions.decorator
 @access_log_opt
-@vcztools_cli.log_options
 @handle_exception
 def mount_plink(vcz_url, mount_dir, basename, access_log_path, **kwargs):
     """Mount a PLINK 1.9 view of VCZ_URL at MOUNT_DIR.
@@ -80,7 +79,8 @@ def mount_plink(vcz_url, mount_dir, basename, access_log_path, **kwargs):
     Spawns a plink-server subprocess that owns the ``VczReader`` and
     serves ``.bed`` reads over an ``AF_UNIX`` socket. ``.bim`` and
     ``.fam`` are precomputed once at mount time and held in the FUSE
-    process's memory; only ``.bed`` reads cross the wire.
+    process's memory; only ``.bed`` reads cross the wire. ``--no-bim``
+    and ``--no-fam`` suppress the corresponding sidecar from the mount.
 
     The bcftools-view-style filter / backend / log options are inherited
     from ``vcztools view-plink``; see ``vcztools view-plink --help`` for the
@@ -88,8 +88,9 @@ def mount_plink(vcz_url, mount_dir, basename, access_log_path, **kwargs):
 
     The mount runs in the foreground until interrupted with Ctrl-C.
     """
+    opts = vcztools.ViewPlinkOptions.pop_from_click_kwargs(kwargs)
     _run_mount(
-        formats.PLINK_SPEC, vcz_url, mount_dir, basename, access_log_path, kwargs
+        formats.PLINK_SPEC, vcz_url, mount_dir, basename, access_log_path, opts, kwargs
     )
 
 
@@ -100,9 +101,8 @@ def mount_plink(vcz_url, mount_dir, basename, access_log_path, **kwargs):
     type=click.Path(file_okay=False, dir_okay=True, path_type=str),
 )
 @_basename_opt("bgen")
-@vcztools_cli.view_plink_options
+@vcztools.ViewBgenOptions.decorator
 @access_log_opt
-@vcztools_cli.log_options
 @handle_exception
 def mount_bgen(vcz_url, mount_dir, basename, access_log_path, **kwargs):
     """Mount an Oxford BGEN view of VCZ_URL at MOUNT_DIR.
@@ -111,16 +111,23 @@ def mount_bgen(vcz_url, mount_dir, basename, access_log_path, **kwargs):
     serves ``.bgen`` reads over an ``AF_UNIX`` socket. ``.sample`` and
     ``.bgen.bgi`` are precomputed once at mount time and held in the
     FUSE process's memory; only ``.bgen`` reads cross the wire.
+    ``--no-sample-file`` and ``--no-bgi`` suppress the corresponding
+    sidecar; ``--no-header-samples`` drops the sample identifiers from
+    the ``.bgen`` header block.
 
     The bcftools-view-style filter / backend / log options are inherited
     from ``vcztools view-bgen``; see ``vcztools view-bgen --help`` for the
     full reference. The encoder always uses zlib level 0 (stored,
     fixed-size blocks) so byte-range random access into the mounted
-    ``.bgen`` is O(1).
+    ``.bgen`` is O(1); ``--compression-level`` is accepted for parity
+    with ``view-bgen`` but has no effect.
 
     The mount runs in the foreground until interrupted with Ctrl-C.
     """
-    _run_mount(formats.BGEN_SPEC, vcz_url, mount_dir, basename, access_log_path, kwargs)
+    opts = vcztools.ViewBgenOptions.pop_from_click_kwargs(kwargs)
+    _run_mount(
+        formats.BGEN_SPEC, vcz_url, mount_dir, basename, access_log_path, opts, kwargs
+    )
 
 
 def _run_mount(
@@ -129,12 +136,11 @@ def _run_mount(
     mount_dir: str,
     basename: str | None,
     access_log_path: str | None,
+    opts,
     extra_kwargs: dict,
 ) -> None:
-    log_config = vcztools_cli.LogConfig.pop_from_click_kwargs(extra_kwargs)
-    reader_options = vcztools_cli.ViewPlinkOptions.pop_from_click_kwargs(extra_kwargs)
     assert extra_kwargs == {}, extra_kwargs
-    log_config.apply()
+    opts.log.apply()
 
     mount_dir_path = pathlib.Path(mount_dir)
     if not mount_dir_path.is_dir():
@@ -151,8 +157,7 @@ def _run_mount(
             vcz_url,
             str(mount_dir_path),
             resolved_basename,
-            reader_options,
-            log_config,
+            opts,
             log_path,
             sock_path,
         )
@@ -163,8 +168,7 @@ async def _amount(
     vcz_url: str,
     mount_dir: str,
     basename: str,
-    reader_options: vcztools_cli.ViewPlinkOptions,
-    log_config: vcztools_cli.LogConfig,
+    opts,
     log_path: pathlib.Path | None,
     sock_path: pathlib.Path,
 ) -> None:
@@ -172,8 +176,7 @@ async def _amount(
         vcz_url,
         sock_path,
         spec,
-        reader_options=reader_options,
-        log_config=log_config,
+        opts=opts,
     ) as client:
         with access_log.AccessLogger(log_path) as access_logger:
             ops = encoder_ops.EncoderOps(

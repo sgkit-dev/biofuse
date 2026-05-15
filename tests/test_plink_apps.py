@@ -24,10 +24,15 @@ import shutil
 
 import pytest
 import trio
-from vcztools.cli import make_reader
-from vcztools.plink import BedEncoder, write_plink
+import vcztools
+from vcztools.plink import write_plink
 
 from biofuse import access_log, encoder_client, encoder_ops, formats, fuse_adapter
+
+
+def _open_reader(path) -> object:
+    return vcztools.ViewPlinkOptions().make_reader(str(path))
+
 
 PLINK1 = shutil.which("plink1.9") or shutil.which("plink")
 PLINK2 = shutil.which("plink2")
@@ -66,7 +71,7 @@ async def fx_mounted_plink(tmp_path, fx_medium_vcz):
     golden = tmp_path / "golden_dir"
     golden.mkdir()
 
-    write_plink(make_reader(str(fx_medium_vcz.path)), golden / "medium")
+    write_plink(_open_reader(fx_medium_vcz.path), golden / "medium")
 
     log = access_log.AccessLogger()
     sock_path = tmp_path / "plink.sock"
@@ -108,8 +113,8 @@ async def _mount_plink(tmp_path, vcz):
 
 
 def _plink_encoder_bytes(vcz_path: pathlib.Path) -> bytes:
-    reader = make_reader(str(vcz_path))
-    with BedEncoder(reader) as enc:
+    reader = _open_reader(vcz_path)
+    with vcztools.BedEncoder(reader) as enc:
         return enc.read(0, enc.total_size)
 
 

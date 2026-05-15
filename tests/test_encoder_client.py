@@ -6,6 +6,7 @@ tests use the parametrised :data:`fx_spec` to exercise both PLINK and
 BGEN through the spawn handshake.
 """
 
+import dataclasses
 import errno
 import multiprocessing as mp
 import pathlib
@@ -15,8 +16,7 @@ import threading
 
 import pytest
 import trio
-from vcztools import cli as vcztools_cli
-from vcztools.cli import make_reader
+import vcztools
 
 from biofuse import encoder_client, encoder_server, formats
 
@@ -27,19 +27,26 @@ def fx_spec(request):
 
 
 @pytest.fixture
-def fx_reader(fx_small_vcz):
-    return make_reader(str(fx_small_vcz.path))
+def fx_opts(fx_spec):
+    if fx_spec.name == "plink":
+        return vcztools.ViewPlinkOptions()
+    return vcztools.ViewBgenOptions()
 
 
 @pytest.fixture
-def fx_expected(fx_reader, fx_spec):
+def fx_reader(fx_small_vcz):
+    return vcztools.ViewPlinkOptions().make_reader(str(fx_small_vcz.path))
+
+
+@pytest.fixture
+def fx_expected(fx_reader, fx_spec, fx_opts):
     """Static-body / stream-size reference for the active spec.
 
     Built directly from the spec to avoid the BGEN / SQLite ``.bgi``
     non-determinism caveats documented in :mod:`test_encoder_server`.
     """
-    static = fx_spec.build_static_files(fx_reader)
-    with fx_spec.encoder_factory(fx_reader) as encoder:
+    static = fx_spec.build_static_files(fx_reader, fx_opts)
+    with fx_spec.encoder_factory(fx_reader, fx_opts) as encoder:
         stream_size = int(encoder.total_size)
     return fx_spec, static, stream_size
 
@@ -56,10 +63,11 @@ class _ThreadServer:
         self,
         reader,
         spec: formats.FormatSpec,
+        opts,
         socket_path: pathlib.Path,
     ) -> None:
         self.exitcode: int | None = None
-        self.session = encoder_server._ServerSession(reader, spec)
+        self.session = encoder_server._ServerSession(reader, spec, opts)
         self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._listener.bind(str(socket_path))
         self._listener.listen(16)
@@ -96,11 +104,12 @@ class _ThreadServer:
 
 
 async def _client_with_thread_server(
-    reader, spec: formats.FormatSpec, socket_path: pathlib.Path
+    reader, spec: formats.FormatSpec, opts, socket_path: pathlib.Path
 ) -> encoder_client.EncoderClient:
-    server = _ThreadServer(reader, spec, socket_path)
+    server = _ThreadServer(reader, spec, opts, socket_path)
     self = encoder_client.EncoderClient.__new__(encoder_client.EncoderClient)
     self.spec = spec
+    self.opts = opts
     self.static_files = {}
     self.stream_size = 0
     self._proc = server
@@ -116,9 +125,9 @@ async def _client_with_thread_server(
 
 
 @pytest.fixture
-async def fx_client(fx_reader, fx_spec, tmp_path):
+async def fx_client(fx_reader, fx_spec, fx_opts, tmp_path):
     socket_path = tmp_path / "encoder.sock"
-    client = await _client_with_thread_server(fx_reader, fx_spec, socket_path)
+    client = await _client_with_thread_server(fx_reader, fx_spec, fx_opts, socket_path)
     try:
         yield client
     finally:
@@ -246,15 +255,21 @@ class TestStreamConnection:
 
 
 class TestClientClose:
-    async def test_aclose_is_idempotent(self, fx_reader, fx_spec, tmp_path):
+    async def test_aclose_is_idempotent(self, fx_reader, fx_spec, fx_opts, tmp_path):
         socket_path = tmp_path / "encoder.sock"
-        client = await _client_with_thread_server(fx_reader, fx_spec, socket_path)
+        client = await _client_with_thread_server(
+            fx_reader, fx_spec, fx_opts, socket_path
+        )
         await client.aclose()
         await client.aclose()
 
-    async def test_aclose_terminates_server_thread(self, fx_reader, fx_spec, tmp_path):
+    async def test_aclose_terminates_server_thread(
+        self, fx_reader, fx_spec, fx_opts, tmp_path
+    ):
         socket_path = tmp_path / "encoder.sock"
-        client = await _client_with_thread_server(fx_reader, fx_spec, socket_path)
+        client = await _client_with_thread_server(
+            fx_reader, fx_spec, fx_opts, socket_path
+        )
         proc = client._proc
         await client.aclose()
         assert not proc.is_alive()
@@ -368,21 +383,24 @@ class TestRealSubprocess:
     async def test_max_alleles_filter_through_start(
         self, fx_multiallelic_vcz, tmp_path
     ):
-        """``ViewPlinkOptions(max_alleles=2)`` flows through the
-        multiprocessing spawn into the worker's ``make_reader_from_options``
-        and drops multi-allelic variants, so the handshake succeeds and
-        the metadata reflects the filtered variant count."""
+        """``ViewPlinkOptions`` with ``--max-alleles 2`` flows through the
+        multiprocessing spawn into the worker's ``opts.make_reader`` and
+        drops multi-allelic variants, so the handshake succeeds and the
+        metadata reflects the filtered variant count."""
         # Sanity: the fixture really is multi-allelic, otherwise the
         # filter has nothing to drop and the test isn't testing anything.
         assert fx_multiallelic_vcz.num_biallelic_sites < (
             fx_multiallelic_vcz.num_variants
         )
         socket_path = tmp_path / "encoder.sock"
+        default_opts = vcztools.ViewPlinkOptions()
+        selection = dataclasses.replace(default_opts.selection, max_alleles=2)
+        opts = dataclasses.replace(default_opts, selection=selection)
         client = await encoder_client.EncoderClient.start(
             str(fx_multiallelic_vcz.path),
             socket_path,
             formats.PLINK_SPEC,
-            reader_options=vcztools_cli.ViewPlinkOptions(max_alleles=2),
+            opts=opts,
         )
         try:
             bim_lines = client.static_files[".bim"].decode("utf-8").splitlines()
@@ -414,8 +432,13 @@ class TestRealSubprocess:
         # via a fresh in-process reader so the test does not depend on
         # external goldens (write_plink / write_bgen). See the
         # encoder-server test module for the rationale.
-        ref_reader = make_reader(str(fx_small_vcz.path))
-        with spec.encoder_factory(ref_reader) as enc:
+        opts = (
+            vcztools.ViewPlinkOptions()
+            if spec.name == "plink"
+            else vcztools.ViewBgenOptions()
+        )
+        ref_reader = opts.make_reader(str(fx_small_vcz.path))
+        with spec.encoder_factory(ref_reader, opts) as enc:
             expected_stream_size = int(enc.total_size)
         socket_path = tmp_path / "encoder.sock"
         client = await encoder_client.EncoderClient.start(
@@ -423,7 +446,7 @@ class TestRealSubprocess:
         )
         try:
             assert client.stream_size == expected_stream_size
-            assert set(client.static_files) == set(spec.static_suffixes)
+            assert set(client.static_files) == set(spec.static_suffixes(opts))
             conn = await client.open_stream()
             try:
                 data = await conn.read(0, client.stream_size)

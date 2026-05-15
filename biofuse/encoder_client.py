@@ -18,7 +18,7 @@ import time
 from collections.abc import Callable
 
 import trio
-from vcztools import cli as vcztools_cli
+import vcztools
 
 from biofuse import encoder_protocol, encoder_server, formats
 
@@ -133,13 +133,14 @@ class EncoderClient:
 
     Attributes populated by the handshake:
 
-    - ``static_files``: dict mapping each suffix declared in
-      ``spec.static_suffixes`` to its precomputed bytes.
+    - ``static_files``: dict mapping each suffix returned by
+      ``spec.static_suffixes(opts)`` to its precomputed bytes.
     - ``stream_size``: total byte size of the streaming file.
     """
 
-    def __init__(self, spec: formats.FormatSpec) -> None:
+    def __init__(self, spec: formats.FormatSpec, opts) -> None:
         self.spec = spec
+        self.opts = opts
         self.static_files: dict[str, bytes] = {}
         self.stream_size: int = 0
         self._proc: mp.process.BaseProcess | None = None
@@ -154,8 +155,7 @@ class EncoderClient:
         socket_path: pathlib.Path,
         spec: formats.FormatSpec,
         *,
-        reader_options: vcztools_cli.ViewPlinkOptions | None = None,
-        log_config: vcztools_cli.LogConfig | None = None,
+        opts=None,
     ) -> "EncoderClient":
         """Spawn the server, run the metadata handshake, return client.
 
@@ -164,16 +164,21 @@ class EncoderClient:
         reduction dups the fds across the spawn boundary; the parent
         closes its own copies once the child has started.
 
-        ``reader_options`` carries the bcftools-view-style filtering
-        options forwarded to vcztools' ``make_reader`` in the worker;
-        ``log_config`` configures logging in the worker so its
-        ``logger.debug`` / ``info`` output reaches the parent's sink.
-        Both default to the empty / WARNING configuration.
+        ``opts`` is the ``vcztools.ViewPlinkOptions`` (for
+        ``spec.name == "plink"``) or ``vcztools.ViewBgenOptions``
+        dataclass parsed from the CLI. It carries the bcftools-style
+        filtering options forwarded to ``opts.make_reader`` in the
+        worker, plus the per-mount feature toggles (``no_bim``,
+        ``no_bgi``, …) and the log-level / log-file settings the
+        worker applies on startup. Defaults to a fresh instance of the
+        format's options dataclass (every field at its dataclass
+        default) when ``None``.
         """
-        if reader_options is None:
-            reader_options = vcztools_cli.ViewPlinkOptions()
-        if log_config is None:
-            log_config = vcztools_cli.LogConfig()
+        if opts is None:
+            if spec.name == "plink":
+                opts = vcztools.ViewPlinkOptions()
+            else:
+                opts = vcztools.ViewBgenOptions()
         socket_path = pathlib.Path(socket_path)
         socket_path.parent.mkdir(parents=True, exist_ok=True)
         if socket_path.exists():
@@ -185,7 +190,7 @@ class EncoderClient:
         ctx = mp.get_context("spawn")
         proc: mp.process.BaseProcess = ctx.Process(
             target=encoder_server._server_main,
-            args=(listener, child_stop, vcz_url, spec, reader_options, log_config),
+            args=(listener, child_stop, vcz_url, spec, opts),
             name=f"biofuse-{spec.name}-server",
         )
         try:
@@ -194,7 +199,7 @@ class EncoderClient:
             listener.close()
             child_stop.close()
 
-        self = cls(spec)
+        self = cls(spec, opts)
         self._proc = proc
         self._socket_path = socket_path
         self._stop_sock = parent_stop
@@ -272,11 +277,12 @@ class EncoderClient:
                 raise encoder_protocol.status_to_error(status)
             prefix = await _recv_exact(stream, encoder_protocol.META_PREFIX_SIZE)
             n_static, stream_size = encoder_protocol.parse_metadata_prefix(prefix)
-            if n_static != len(self.spec.static_suffixes):
+            expected_suffixes = self.spec.static_suffixes(self.opts)
+            if n_static != len(expected_suffixes):
                 raise OSError(
                     errno.EIO,
                     f"{self.spec.name}-server reported {n_static} static files; "
-                    f"client expected {len(self.spec.static_suffixes)}",
+                    f"client expected {len(expected_suffixes)}",
                 )
             sizes_buf = await _recv_exact(
                 stream, n_static * encoder_protocol.META_SIZE_ENTRY_SIZE
@@ -284,7 +290,7 @@ class EncoderClient:
             sizes = encoder_protocol.parse_static_sizes(sizes_buf, n_static)
             self.static_files = {
                 suffix: await _recv_exact(stream, size)
-                for suffix, size in zip(self.spec.static_suffixes, sizes, strict=True)
+                for suffix, size in zip(expected_suffixes, sizes, strict=True)
             }
             self.stream_size = stream_size
         finally:
