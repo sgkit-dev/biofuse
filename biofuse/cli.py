@@ -111,7 +111,9 @@ def mount_bgen(vcz_url, mount_dir, basename, access_log_path, **kwargs):
     FUSE process's memory; only ``.bgen`` reads cross the wire.
     ``--no-sample-file`` and ``--no-bgi`` suppress the corresponding
     sidecar; ``--no-header-samples`` drops the sample identifiers from
-    the ``.bgen`` header block.
+    the ``.bgen`` header block. ``--unphased`` ignores the input's
+    ``call_genotype_phased`` field and encodes every variant with the
+    BGEN phased flag clear.
 
     The bcftools-view-style filter / backend / log options are inherited
     from ``vcztools view-bgen``; see ``vcztools view-bgen --help`` for the

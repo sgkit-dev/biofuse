@@ -313,6 +313,34 @@ class TestBgenHeaderSamplesToggle:
         assert data == ref_data
 
 
+class TestBgenUnphasedToggle:
+    """``--unphased`` flows through to ``BgenEncoder(unphased=True)``.
+
+    With the flag set, the encoder must ignore ``call_genotype_phased``
+    and produce the same bytes as an in-process ``BgenEncoder`` built
+    with ``unphased=True`` on the same reader.
+    """
+
+    def test_unphased_matches_in_process(self, fx_reader, fx_small_vcz):
+        opts = vcztools.ViewBgenOptions(unphased=True)
+        with formats.BGEN_SPEC.encoder_factory(fx_reader, opts) as encoder:
+            data = encoder.read(0, encoder.total_size)
+        ref_reader = _open_reader(fx_small_vcz.path)
+        with vcztools.BgenEncoder(ref_reader, unphased=True) as ref:
+            ref_data = ref.read(0, ref.total_size)
+        assert data == ref_data
+
+    def test_unphased_default_matches_in_process(self, fx_reader, fx_small_vcz):
+        opts = vcztools.ViewBgenOptions()
+        assert opts.unphased is False
+        with formats.BGEN_SPEC.encoder_factory(fx_reader, opts) as encoder:
+            data = encoder.read(0, encoder.total_size)
+        ref_reader = _open_reader(fx_small_vcz.path)
+        with vcztools.BgenEncoder(ref_reader, unphased=False) as ref:
+            ref_data = ref.read(0, ref.total_size)
+        assert data == ref_data
+
+
 class TestSpecsRegistry:
     def test_specs_dict_has_both_entries(self):
         assert formats.SPECS == {"plink": formats.PLINK_SPEC, "bgen": formats.BGEN_SPEC}
