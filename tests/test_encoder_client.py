@@ -424,6 +424,78 @@ class TestRealSubprocess:
         assert not client._proc.is_alive()
         assert client._proc.exitcode == 0
 
+    @pytest.mark.parametrize("no_header_samples", [True, False])
+    async def test_bgen_no_header_samples_stable_across_opens(
+        self, fx_small_vcz, tmp_path, no_header_samples
+    ):
+        """``--no-header-samples`` flows into every per-connection
+        ``BgenEncoder`` consistently.
+
+        Each ``open_stream`` spawns a fresh server-side thread that
+        constructs a new encoder via ``spec.encoder_factory(reader, opts)``.
+        Three sequential open/read/close cycles must all return the same
+        bytes — and those bytes must match an in-process reference
+        ``BgenEncoder`` constructed with the matching
+        ``embed_header_samples`` flag.
+        """
+        opts = dataclasses.replace(
+            vcztools.ViewBgenOptions(), no_header_samples=no_header_samples
+        )
+        ref_reader = opts.make_reader(str(fx_small_vcz.path))
+        with vcztools.BgenEncoder(
+            ref_reader, embed_header_samples=not no_header_samples
+        ) as ref:
+            expected_size = int(ref.total_size)
+            expected = ref.read(0, expected_size)
+
+        socket_path = tmp_path / "encoder.sock"
+        async with await encoder_client.EncoderClient.start(
+            str(fx_small_vcz.path), socket_path, formats.BGEN_SPEC, opts=opts
+        ) as client:
+            assert client.stream_size == expected_size
+            for cycle in range(3):
+                conn = await client.open_stream()
+                try:
+                    data = await conn.read(0, client.stream_size)
+                finally:
+                    await conn.aclose()
+                assert data == expected, f"cycle {cycle} differed from reference"
+
+    @pytest.mark.parametrize(
+        ("no_sample_file", "no_bgi"),
+        [(True, False), (False, True), (True, True), (False, False)],
+    )
+    async def test_bgen_sidecar_toggles_stable_across_starts(
+        self, fx_small_vcz, tmp_path, no_sample_file, no_bgi
+    ):
+        """The handshake's ``static_files`` honours ``--no-sample-file``
+        / ``--no-bgi`` and yields the same suffix set on each
+        ``EncoderClient.start`` against the same options."""
+        opts = dataclasses.replace(
+            vcztools.ViewBgenOptions(),
+            no_sample_file=no_sample_file,
+            no_bgi=no_bgi,
+        )
+        expected_suffixes = formats.BGEN_SPEC.static_suffixes(opts)
+        first: dict[str, bytes] | None = None
+        for cycle in range(3):
+            socket_path = tmp_path / f"encoder-{cycle}.sock"
+            async with await encoder_client.EncoderClient.start(
+                str(fx_small_vcz.path), socket_path, formats.BGEN_SPEC, opts=opts
+            ) as client:
+                assert tuple(client.static_files) == expected_suffixes
+                # ``.bgen.bgi`` SQLite payloads have non-deterministic
+                # header bytes across independent writes; compare sizes
+                # only for that entry and the full body for ``.sample``.
+                if first is None:
+                    first = dict(client.static_files)
+                    continue
+                for suffix, body in client.static_files.items():
+                    if suffix == ".bgen.bgi":
+                        assert len(body) == len(first[suffix])
+                    else:
+                        assert body == first[suffix]
+
     @pytest.mark.parametrize(
         "spec", [formats.PLINK_SPEC, formats.BGEN_SPEC], ids=["plink", "bgen"]
     )
