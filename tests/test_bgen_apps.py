@@ -8,6 +8,7 @@ encoder's bytes.
 """
 
 import contextlib
+import dataclasses
 import errno
 import os
 import pathlib
@@ -88,14 +89,19 @@ async def _arun(cmd) -> None:
 
 
 @contextlib.asynccontextmanager
-async def _mount_bgen(tmp_path, vcz):
-    """Mount ``vcz`` as a BGEN fileset; yield ``(mnt, basename)``."""
+async def _mount_bgen(tmp_path, vcz, opts=None):
+    """Mount ``vcz`` as a BGEN fileset; yield ``(mnt, basename)``.
+
+    ``opts`` is the ``vcztools.ViewBgenOptions`` dataclass the
+    encoder-server runs under; defaults to a fresh ``ViewBgenOptions()``
+    (every field at its dataclass default).
+    """
     mnt = tmp_path / "mnt"
     mnt.mkdir()
     basename = vcz.path.stem
     sock_path = tmp_path / "bgen.sock"
     async with await encoder_client.EncoderClient.start(
-        str(vcz.path), sock_path, formats.BGEN_SPEC
+        str(vcz.path), sock_path, formats.BGEN_SPEC, opts=opts
     ) as client:
         ops = encoder_ops.EncoderOps(client, basename, formats.BGEN_SPEC)
         async with fuse_adapter.mount(ops, str(mnt)):
@@ -142,6 +148,39 @@ class TestBgenSeekable:
         ]:
             got = await trio.to_thread.run_sync(_pread_sync, bgen_path, off, size)
             assert got == expected[off : off + size]
+
+
+class TestBgenOptionsAcrossOpens:
+    """Open the mounted ``.bgen`` repeatedly and verify the bytes are
+    invariant under the mount's options dataclass.
+
+    Each ``open()`` of the streaming file triggers a fresh FUSE ``open``
+    handler → fresh socket → fresh server-side thread that constructs
+    its own :class:`vcztools.BgenEncoder` via
+    ``spec.encoder_factory(reader, opts)``. The test pins that the
+    options dataclass flows through every per-connection encoder
+    consistently — e.g. ``--no-header-samples`` keeps producing the
+    same header-stripped bytes on the 2nd and 3rd read after open/close.
+    """
+
+    @pytest.mark.parametrize("no_header_samples", [True, False])
+    async def test_no_header_samples_stable_across_opens(
+        self, tmp_path, fx_small_vcz, no_header_samples
+    ):
+        opts = dataclasses.replace(
+            vcztools.ViewBgenOptions(), no_header_samples=no_header_samples
+        )
+        ref_reader = opts.make_reader(str(fx_small_vcz.path))
+        with vcztools.BgenEncoder(
+            ref_reader, embed_header_samples=not no_header_samples
+        ) as ref:
+            expected = ref.read(0, ref.total_size)
+
+        async with _mount_bgen(tmp_path, fx_small_vcz, opts=opts) as (mnt, basename):
+            bgen_path = mnt / f"{basename}.bgen"
+            for cycle in range(3):
+                data = await trio.to_thread.run_sync(bgen_path.read_bytes)
+                assert data == expected, f"cycle {cycle} differed from reference"
 
 
 def _pread_sync(path: pathlib.Path, off: int, size: int) -> bytes:
