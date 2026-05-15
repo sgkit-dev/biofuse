@@ -129,7 +129,11 @@ def _plink_encoder_factory(reader, opts):
 
 
 def _bgen_encoder_factory(reader, opts):
-    return vcztools.BgenEncoder(reader, embed_header_samples=not opts.no_header_samples)
+    return vcztools.BgenEncoder(
+        reader,
+        embed_header_samples=not opts.no_header_samples,
+        unphased=opts.unphased,
+    )
 
 
 PLINK_SPEC = FormatSpec(

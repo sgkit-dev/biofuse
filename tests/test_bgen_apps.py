@@ -182,6 +182,19 @@ class TestBgenOptionsAcrossOpens:
                 data = await trio.to_thread.run_sync(bgen_path.read_bytes)
                 assert data == expected, f"cycle {cycle} differed from reference"
 
+    @pytest.mark.parametrize("unphased", [True, False])
+    async def test_unphased_stable_across_opens(self, tmp_path, fx_small_vcz, unphased):
+        opts = dataclasses.replace(vcztools.ViewBgenOptions(), unphased=unphased)
+        ref_reader = opts.make_reader(str(fx_small_vcz.path))
+        with vcztools.BgenEncoder(ref_reader, unphased=unphased) as ref:
+            expected = ref.read(0, ref.total_size)
+
+        async with _mount_bgen(tmp_path, fx_small_vcz, opts=opts) as (mnt, basename):
+            bgen_path = mnt / f"{basename}.bgen"
+            for cycle in range(3):
+                data = await trio.to_thread.run_sync(bgen_path.read_bytes)
+                assert data == expected, f"cycle {cycle} differed from reference"
+
 
 def _pread_sync(path: pathlib.Path, off: int, size: int) -> bytes:
     with path.open("rb") as f:
