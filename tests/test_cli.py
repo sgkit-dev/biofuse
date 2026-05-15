@@ -35,6 +35,13 @@ class TestHelp:
             "--log-level",
         ]:
             assert flag in result.output, f"missing {flag} in mount-plink help"
+        for section in [
+            "Selection options:",
+            "Zarr store options:",
+            "Reader options:",
+            "Logging options:",
+        ]:
+            assert section in result.output, f"missing {section} in mount-plink help"
 
     def test_mount_bgen_help(self):
         result = CliRunner().invoke(cli.biofuse_main, ["mount-bgen", "--help"])
@@ -47,10 +54,16 @@ class TestHelp:
             "--no-sample-file",
             "--no-bgi",
             "--no-header-samples",
-            "--compression-level",
             "--log-level",
         ]:
             assert flag in result.output, f"missing {flag} in mount-bgen help"
+        for section in [
+            "Selection options:",
+            "Zarr store options:",
+            "Reader options:",
+            "Logging options:",
+        ]:
+            assert section in result.output, f"missing {section} in mount-bgen help"
 
     def test_version(self):
         result = CliRunner().invoke(cli.biofuse_main, ["--version"])

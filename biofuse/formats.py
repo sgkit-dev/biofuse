@@ -27,20 +27,18 @@ The set of static sidecars served by a mount is a function of the
 sample identifiers from its header block.
 
 For BGEN the ``.bgen.bgi`` sidecar is a SQLite database that
-:func:`vcztools.bgen.write_bgen_index` writes to a filesystem path.
-We materialise it to a tempfile at session-init time, read the bytes
-back, and hold them in the server process's memory alongside the
-``.sample`` text.
+:func:`vcztools.write_bgi` writes to a filesystem path. We materialise
+it to a tempfile at session-init time, read the bytes back, and hold
+them in the server process's memory alongside the ``.sample`` text.
 """
 
 import dataclasses
+import io
 import pathlib
 import tempfile
 from collections.abc import Callable
 
 import vcztools
-from vcztools import bgen as vcztools_bgen
-from vcztools import plink as vcztools_plink
 
 
 @dataclasses.dataclass(frozen=True)
@@ -86,9 +84,13 @@ def _plink_static_suffixes(opts) -> tuple[str, ...]:
 def _build_plink_static(reader, opts) -> dict[str, bytes]:
     out: dict[str, bytes] = {}
     if not opts.no_bim:
-        out[".bim"] = vcztools_plink.generate_bim(reader).encode("utf-8")
+        buf = io.StringIO()
+        vcztools.write_bim(reader, buf)
+        out[".bim"] = buf.getvalue().encode("utf-8")
     if not opts.no_fam:
-        out[".fam"] = vcztools_plink.generate_fam(reader).encode("utf-8")
+        buf = io.StringIO()
+        vcztools.write_fam(reader, buf)
+        out[".fam"] = buf.getvalue().encode("utf-8")
     return out
 
 
@@ -104,18 +106,20 @@ def _bgen_static_suffixes(opts) -> tuple[str, ...]:
 def _build_bgen_static(reader, opts) -> dict[str, bytes]:
     out: dict[str, bytes] = {}
     if not opts.no_sample_file:
-        out[".sample"] = vcztools_bgen.generate_sample(reader).encode("utf-8")
+        buf = io.StringIO()
+        vcztools.write_sample(reader, buf)
+        out[".sample"] = buf.getvalue().encode("utf-8")
     if not opts.no_bgi:
-        # ``write_bgen_index`` takes a filesystem path. Materialise the
-        # .bgi into a TemporaryDirectory, read the bytes back, then let
-        # the context manager clean up. The encoder used to harvest
-        # ``variant_offsets`` is I/O-free in ``__init__`` and is
-        # discarded once the offsets are read.
+        # ``write_bgi`` requires a filesystem path (sqlite3.connect needs
+        # a real path). Materialise the .bgi into a TemporaryDirectory,
+        # read the bytes back, then let the context manager clean up.
+        # The encoder used to harvest ``variant_offsets`` is I/O-free in
+        # ``__init__`` and is discarded once the offsets are read.
         with vcztools.BgenEncoder(reader) as encoder:
             variant_offsets = encoder.variant_offsets
         with tempfile.TemporaryDirectory(prefix="biofuse-bgen-") as tmp_dir:
             bgi_path = pathlib.Path(tmp_dir) / "index.bgen.bgi"
-            vcztools_bgen.write_bgen_index(reader, str(bgi_path), variant_offsets)
+            vcztools.write_bgi(reader, str(bgi_path), variant_offsets)
             out[".bgen.bgi"] = bgi_path.read_bytes()
     return out
 

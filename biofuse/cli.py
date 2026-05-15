@@ -63,7 +63,7 @@ def biofuse_main():
     """biofuse: read-only FUSE filesystem views over VCF Zarr data."""
 
 
-@biofuse_main.command(name="mount-plink")
+@biofuse_main.command(name="mount-plink", cls=vcztools.GroupedCommand)
 @click.argument("vcz_url", type=str)
 @click.argument(
     "mount_dir",
@@ -88,13 +88,11 @@ def mount_plink(vcz_url, mount_dir, basename, access_log_path, **kwargs):
 
     The mount runs in the foreground until interrupted with Ctrl-C.
     """
-    opts = vcztools.ViewPlinkOptions.pop_from_click_kwargs(kwargs)
-    _run_mount(
-        formats.PLINK_SPEC, vcz_url, mount_dir, basename, access_log_path, opts, kwargs
-    )
+    opts = vcztools.ViewPlinkOptions.from_click_kwargs(kwargs)
+    _run_mount(formats.PLINK_SPEC, vcz_url, mount_dir, basename, access_log_path, opts)
 
 
-@biofuse_main.command(name="mount-bgen")
+@biofuse_main.command(name="mount-bgen", cls=vcztools.GroupedCommand)
 @click.argument("vcz_url", type=str)
 @click.argument(
     "mount_dir",
@@ -119,15 +117,12 @@ def mount_bgen(vcz_url, mount_dir, basename, access_log_path, **kwargs):
     from ``vcztools view-bgen``; see ``vcztools view-bgen --help`` for the
     full reference. The encoder always uses zlib level 0 (stored,
     fixed-size blocks) so byte-range random access into the mounted
-    ``.bgen`` is O(1); ``--compression-level`` is accepted for parity
-    with ``view-bgen`` but has no effect.
+    ``.bgen`` is O(1).
 
     The mount runs in the foreground until interrupted with Ctrl-C.
     """
-    opts = vcztools.ViewBgenOptions.pop_from_click_kwargs(kwargs)
-    _run_mount(
-        formats.BGEN_SPEC, vcz_url, mount_dir, basename, access_log_path, opts, kwargs
-    )
+    opts = vcztools.ViewBgenOptions.from_click_kwargs(kwargs)
+    _run_mount(formats.BGEN_SPEC, vcz_url, mount_dir, basename, access_log_path, opts)
 
 
 def _run_mount(
@@ -137,9 +132,7 @@ def _run_mount(
     basename: str | None,
     access_log_path: str | None,
     opts,
-    extra_kwargs: dict,
 ) -> None:
-    assert extra_kwargs == {}, extra_kwargs
     opts.log.apply()
 
     mount_dir_path = pathlib.Path(mount_dir)

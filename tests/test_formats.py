@@ -7,15 +7,20 @@ shared :class:`VczReader` under a given options dataclass, and each
 the same selection.
 """
 
+import io
 import sqlite3
 import tempfile
 
 import pytest
 import vcztools
-from vcztools import bgen as vcztools_bgen
-from vcztools import plink as vcztools_plink
 
 from biofuse import formats
+
+
+def _write_to_string(writer, reader):
+    buf = io.StringIO()
+    writer(reader, buf)
+    return buf.getvalue().encode("utf-8")
 
 
 def _open_reader(path):
@@ -54,11 +59,11 @@ class TestPlinkSpec:
         assert formats.PLINK_SPEC.streaming_kind == "bed"
         assert formats.PLINK_SPEC.static_suffixes(fx_plink_opts) == (".bim", ".fam")
 
-    def test_static_files_match_generators(self, fx_reader, fx_plink_opts):
+    def test_static_files_match_writers(self, fx_reader, fx_plink_opts):
         static = formats.PLINK_SPEC.build_static_files(fx_reader, fx_plink_opts)
         assert set(static) == {".bim", ".fam"}
-        assert static[".bim"] == vcztools_plink.generate_bim(fx_reader).encode("utf-8")
-        assert static[".fam"] == vcztools_plink.generate_fam(fx_reader).encode("utf-8")
+        assert static[".bim"] == _write_to_string(vcztools.write_bim, fx_reader)
+        assert static[".fam"] == _write_to_string(vcztools.write_fam, fx_reader)
 
     def test_encoder_total_size(self, fx_reader, fx_small_vcz, fx_plink_opts):
         with formats.PLINK_SPEC.encoder_factory(fx_reader, fx_plink_opts) as encoder:
@@ -81,11 +86,9 @@ class TestBgenSpec:
         static = formats.BGEN_SPEC.build_static_files(fx_reader, fx_bgen_opts)
         assert set(static) == {".sample", ".bgen.bgi"}
 
-    def test_sample_matches_generator(self, fx_reader, fx_bgen_opts):
+    def test_sample_matches_writer(self, fx_reader, fx_bgen_opts):
         static = formats.BGEN_SPEC.build_static_files(fx_reader, fx_bgen_opts)
-        assert static[".sample"] == vcztools_bgen.generate_sample(fx_reader).encode(
-            "utf-8"
-        )
+        assert static[".sample"] == _write_to_string(vcztools.write_sample, fx_reader)
 
     def test_bgi_opens_as_sqlite(self, fx_reader, tmp_path, fx_small_vcz, fx_bgen_opts):
         static = formats.BGEN_SPEC.build_static_files(fx_reader, fx_bgen_opts)
