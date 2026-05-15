@@ -23,10 +23,7 @@ import threading
 import time
 
 import pytest
-from vcztools import bgen as vcztools_bgen
-from vcztools import cli as vcztools_cli
-from vcztools import plink as vcztools_plink
-from vcztools.cli import make_reader
+import vcztools
 
 from biofuse import encoder_protocol, encoder_server, formats
 
@@ -37,32 +34,41 @@ def fx_spec(request):
 
 
 @pytest.fixture
-def fx_expected(fx_reader, fx_spec):
+def fx_opts(fx_spec):
+    """Default options dataclass matching the parametrised spec."""
+    if fx_spec.name == "plink":
+        return vcztools.ViewPlinkOptions()
+    return vcztools.ViewBgenOptions()
+
+
+@pytest.fixture
+def fx_expected(fx_reader, fx_spec, fx_opts):
     """Spec-direct reference outputs.
 
     Returns ``(spec, static_files, stream_size)`` produced by calling
-    ``spec.build_static_files`` / the throwaway encoder directly. This is
-    the source of truth for the server's behaviour; on-disk goldens via
-    ``write_plink`` / ``write_bgen`` are not used here because BGEN's
-    ``write_bgen`` defaults to a compressed (non-fixed-size) layout that
-    deliberately differs from the encoder's level-0 random-access layout,
-    and SQLite ``.bgi`` files written in separate calls have
-    non-deterministic page metadata.
+    ``spec.build_static_files`` / the throwaway encoder directly under
+    the default options dataclass. This is the source of truth for the
+    server's behaviour; on-disk goldens via ``write_plink`` /
+    ``write_bgen`` are not used here because BGEN's ``write_bgen``
+    defaults to a compressed (non-fixed-size) layout that deliberately
+    differs from the encoder's level-0 random-access layout, and SQLite
+    ``.bgi`` files written in separate calls have non-deterministic page
+    metadata.
     """
-    static_files = fx_spec.build_static_files(fx_reader)
-    with fx_spec.encoder_factory(fx_reader) as encoder:
+    static_files = fx_spec.build_static_files(fx_reader, fx_opts)
+    with fx_spec.encoder_factory(fx_reader, fx_opts) as encoder:
         stream_size = int(encoder.total_size)
     return fx_spec, static_files, stream_size
 
 
 @pytest.fixture
 def fx_reader(fx_small_vcz):
-    return make_reader(str(fx_small_vcz.path))
+    return vcztools.ViewPlinkOptions().make_reader(str(fx_small_vcz.path))
 
 
 @pytest.fixture
-def fx_session(fx_reader, fx_spec):
-    return encoder_server._ServerSession(fx_reader, fx_spec)
+def fx_session(fx_reader, fx_spec, fx_opts):
+    return encoder_server._ServerSession(fx_reader, fx_spec, fx_opts)
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
@@ -123,7 +129,7 @@ def _spawn_serve_connection(
 
     def target():
         try:
-            with session.spec.encoder_factory(session.reader) as encoder:
+            with session.spec.encoder_factory(session.reader, session.opts) as encoder:
                 encoder_server._serve_connection(
                     child_sock, session, encoder, "test-thread"
                 )
@@ -183,7 +189,7 @@ class TestMakeMetadataReply:
         n_static, stream_size = encoder_protocol.parse_metadata_prefix(
             body[: encoder_protocol.META_PREFIX_SIZE]
         )
-        assert n_static == len(spec.static_suffixes)
+        assert n_static == len(spec.static_suffixes(fx_session.opts))
         assert stream_size == expected_stream_size
         sizes_size = n_static * encoder_protocol.META_SIZE_ENTRY_SIZE
         sizes = encoder_protocol.parse_static_sizes(
@@ -193,22 +199,26 @@ class TestMakeMetadataReply:
             ],
             n_static,
         )
-        for suffix, size in zip(spec.static_suffixes, sizes, strict=True):
+        suffixes = spec.static_suffixes(fx_session.opts)
+        for suffix, size in zip(suffixes, sizes, strict=True):
             assert size == len(expected_static[suffix])
 
-    def test_missing_suffix_raises_value_error(self, fx_reader, fx_spec):
-        bad_spec = dataclasses.replace(fx_spec, build_static_files=lambda reader: {})
-        session = encoder_server._ServerSession(fx_reader, bad_spec)
+    def test_missing_suffix_raises_value_error(self, fx_reader, fx_spec, fx_opts):
+        bad_spec = dataclasses.replace(
+            fx_spec, build_static_files=lambda reader, opts: {}
+        )
+        session = encoder_server._ServerSession(fx_reader, bad_spec, fx_opts)
         with pytest.raises(ValueError, match="returned keys"):
             encoder_server._make_metadata_reply(session)
 
-    def test_extra_suffix_raises_value_error(self, fx_reader, fx_spec):
+    def test_extra_suffix_raises_value_error(self, fx_reader, fx_spec, fx_opts):
         original_build = fx_spec.build_static_files
-        bad_spec = dataclasses.replace(
-            fx_spec,
-            build_static_files=lambda r: {**original_build(r), ".unexpected": b"x"},
-        )
-        session = encoder_server._ServerSession(fx_reader, bad_spec)
+
+        def with_extra(r, o):
+            return {**original_build(r, o), ".unexpected": b"x"}
+
+        bad_spec = dataclasses.replace(fx_spec, build_static_files=with_extra)
+        session = encoder_server._ServerSession(fx_reader, bad_spec, fx_opts)
         with pytest.raises(ValueError, match="returned keys"):
             encoder_server._make_metadata_reply(session)
 
@@ -284,10 +294,12 @@ class TestServeConnection:
     integration tests don't reach."""
 
     def test_dispatch_exception_replies_errno_and_loop_continues(
-        self, fx_reader, fx_spec
+        self, fx_reader, fx_spec, fx_opts
     ):
-        bad_spec = dataclasses.replace(fx_spec, build_static_files=lambda reader: {})
-        session = encoder_server._ServerSession(fx_reader, bad_spec)
+        bad_spec = dataclasses.replace(
+            fx_spec, build_static_files=lambda reader, opts: {}
+        )
+        session = encoder_server._ServerSession(fx_reader, bad_spec, fx_opts)
         parent, thread = _spawn_serve_connection(session)
         try:
             for _ in range(2):
@@ -313,7 +325,9 @@ class TestServeConnection:
         parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             with caplog.at_level(logging.WARNING, logger="biofuse.encoder_server"):
-                with fx_session.spec.encoder_factory(fx_session.reader) as encoder:
+                with fx_session.spec.encoder_factory(
+                    fx_session.reader, fx_session.opts
+                ) as encoder:
                     encoder_server._serve_connection(child, fx_session, encoder, "test")
         finally:
             parent.close()
@@ -357,15 +371,14 @@ class TestServeConnection:
 class TestHandleConnectionMetadata:
     def test_get_metadata_returns_full_static(self, fx_session, fx_expected):
         spec, expected_static, expected_stream_size = fx_expected
+        suffixes = spec.static_suffixes(fx_session.opts)
         parent, thread = _spawn_handle_connection(fx_session)
         try:
             parent.sendall(encoder_protocol.pack_get_metadata_request())
             status, body = _read_status_and_body(parent)
-            n_static = len(spec.static_suffixes)
+            n_static = len(suffixes)
             sizes_size = n_static * encoder_protocol.META_SIZE_ENTRY_SIZE
-            static_sizes = [
-                len(expected_static[suffix]) for suffix in spec.static_suffixes
-            ]
+            static_sizes = [len(expected_static[suffix]) for suffix in suffixes]
             expected_body_size = (
                 encoder_protocol.META_PREFIX_SIZE + sizes_size + sum(static_sizes)
             )
@@ -382,7 +395,7 @@ class TestHandleConnectionMetadata:
             )
             assert sizes == tuple(static_sizes)
             offset = sizes_end
-            for suffix, size in zip(spec.static_suffixes, sizes, strict=True):
+            for suffix, size in zip(suffixes, sizes, strict=True):
                 assert size == len(expected_static[suffix])
                 # ``.bgi`` SQLite bytes can differ across independent writes
                 # in non-payload header fields, so compare sizes only for
@@ -478,8 +491,10 @@ class TestHandleConnectionEncoderConstructionFailure:
             def __init__(self, *args, **kwargs):
                 raise OSError(errno.EACCES, "boom")
 
-        session = encoder_server._ServerSession(fx_reader, formats.PLINK_SPEC)
-        monkeypatch.setattr(vcztools_plink, "BedEncoder", _BoomEncoder)
+        session = encoder_server._ServerSession(
+            fx_reader, formats.PLINK_SPEC, vcztools.ViewPlinkOptions()
+        )
+        monkeypatch.setattr(vcztools, "BedEncoder", _BoomEncoder)
         parent, thread = _spawn_handle_connection(session)
         try:
             status, body = _read_status_and_body(parent)
@@ -495,8 +510,10 @@ class TestHandleConnectionEncoderConstructionFailure:
             def __init__(self, *args, **kwargs):
                 raise OSError(errno.EACCES, "boom")
 
-        session = encoder_server._ServerSession(fx_reader, formats.BGEN_SPEC)
-        monkeypatch.setattr(vcztools_bgen, "BgenEncoder", _BoomEncoder)
+        session = encoder_server._ServerSession(
+            fx_reader, formats.BGEN_SPEC, vcztools.ViewBgenOptions()
+        )
+        monkeypatch.setattr(vcztools, "BgenEncoder", _BoomEncoder)
         parent, thread = _spawn_handle_connection(session)
         try:
             status, body = _read_status_and_body(parent)
@@ -512,8 +529,10 @@ class TestHandleConnectionEncoderConstructionFailure:
             def __init__(self, *args, **kwargs):
                 raise RuntimeError("not an OSError")
 
-        session = encoder_server._ServerSession(fx_reader, formats.PLINK_SPEC)
-        monkeypatch.setattr(vcztools_plink, "BedEncoder", _BoomEncoder)
+        session = encoder_server._ServerSession(
+            fx_reader, formats.PLINK_SPEC, vcztools.ViewPlinkOptions()
+        )
+        monkeypatch.setattr(vcztools, "BedEncoder", _BoomEncoder)
         parent, thread = _spawn_handle_connection(session)
         try:
             status, body = _read_status_and_body(parent)
@@ -665,6 +684,11 @@ class TestServerMainHandshakeFailure:
         listener.listen(8)
         parent_stop, child_stop = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         ctx = mp.get_context("spawn")
+        opts = (
+            vcztools.ViewPlinkOptions()
+            if spec.name == "plink"
+            else vcztools.ViewBgenOptions()
+        )
         proc = ctx.Process(
             target=encoder_server._server_main,
             args=(
@@ -672,8 +696,7 @@ class TestServerMainHandshakeFailure:
                 child_stop,
                 str(fx_multiallelic_vcz.path),
                 spec,
-                vcztools_cli.ViewPlinkOptions(),
-                vcztools_cli.LogConfig(),
+                opts,
             ),
         )
         proc.start()
@@ -730,6 +753,11 @@ class TestServerMainSmoke:
         listener.listen(8)
         parent_stop, child_stop = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         ctx = mp.get_context("spawn")
+        opts = (
+            vcztools.ViewPlinkOptions()
+            if spec.name == "plink"
+            else vcztools.ViewBgenOptions()
+        )
         proc = ctx.Process(
             target=encoder_server._server_main,
             args=(
@@ -737,8 +765,7 @@ class TestServerMainSmoke:
                 child_stop,
                 str(fx_small_vcz.path),
                 spec,
-                vcztools_cli.ViewPlinkOptions(),
-                vcztools_cli.LogConfig(),
+                opts,
             ),
         )
         proc.start()
@@ -767,7 +794,7 @@ class TestServerMainSmoke:
                 n_static, stream_size = encoder_protocol.parse_metadata_prefix(
                     body[: encoder_protocol.META_PREFIX_SIZE]
                 )
-                assert n_static == len(spec.static_suffixes)
+                assert n_static == len(spec.static_suffixes(opts))
                 assert stream_size > 0
             finally:
                 client_sock.close()

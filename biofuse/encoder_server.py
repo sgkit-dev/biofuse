@@ -27,8 +27,6 @@ import socket
 import threading
 import time
 
-from vcztools import cli as vcztools_cli
-
 from biofuse import encoder_protocol, formats
 
 logger = logging.getLogger(__name__)
@@ -37,8 +35,10 @@ logger = logging.getLogger(__name__)
 class _ServerSession:
     """Server-side state shared across all connection threads.
 
-    Holds the ``VczReader`` and the active format spec. The static
-    sidecar bytes and the streaming-file size are both built on demand
+    Holds the ``VczReader``, the active format spec, and the options
+    dataclass that selected this mount's feature flags
+    (``--no-bim``/``--no-bgi``/``--no-header-samples``/…). The static
+    sidecar bytes and the streaming-file size are built on demand
     inside the metadata handshake (see ``_make_metadata_reply``)
     rather than cached here — the parent fuse handler is the canonical
     owner of that metadata after the handshake completes. Immutable
@@ -50,9 +50,11 @@ class _ServerSession:
         self,
         reader,
         spec: formats.FormatSpec,
+        opts,
     ) -> None:
         self.reader = reader
         self.spec = spec
+        self.opts = opts
 
 
 def _recv_exact_sync(sock: socket.socket, n: int) -> bytes:
@@ -99,17 +101,18 @@ def _make_metadata_reply(session: "_ServerSession") -> bytes:
     the handshake. Encoder construction is I/O-free so reading
     ``total_size`` here is cheap.
     """
-    static_files = session.spec.build_static_files(session.reader)
-    missing = set(session.spec.static_suffixes) - set(static_files)
-    extra = set(static_files) - set(session.spec.static_suffixes)
+    expected_suffixes = session.spec.static_suffixes(session.opts)
+    static_files = session.spec.build_static_files(session.reader, session.opts)
+    missing = set(expected_suffixes) - set(static_files)
+    extra = set(static_files) - set(expected_suffixes)
     if missing or extra:
         raise ValueError(
             f"{session.spec.name}: build_static_files returned keys "
-            f"{sorted(static_files)}; expected {list(session.spec.static_suffixes)}"
+            f"{sorted(static_files)}; expected {list(expected_suffixes)}"
         )
-    with session.spec.encoder_factory(session.reader) as encoder:
+    with session.spec.encoder_factory(session.reader, session.opts) as encoder:
         stream_size = int(encoder.total_size)
-    ordered_bodies = [static_files[suffix] for suffix in session.spec.static_suffixes]
+    ordered_bodies = [static_files[suffix] for suffix in expected_suffixes]
     return encoder_protocol.pack_metadata_reply(ordered_bodies, stream_size)
 
 
@@ -197,7 +200,7 @@ def _handle_connection(conn_sock: socket.socket, session: _ServerSession) -> Non
     with conn_sock:
         try:
             t_enc = time.monotonic()
-            encoder_cm = session.spec.encoder_factory(session.reader)
+            encoder_cm = session.spec.encoder_factory(session.reader, session.opts)
         except Exception as exc:  # noqa: BLE001 - any error becomes errno reply
             _send_reply(
                 conn_sock, _make_error_reply(exc, "encoder construction failed")
@@ -274,8 +277,7 @@ def _server_main(
     stop_sock: socket.socket,
     vcz_url: str,
     spec: formats.FormatSpec,
-    reader_options: vcztools_cli.ViewPlinkOptions,
-    log_config: vcztools_cli.LogConfig,
+    opts,
 ) -> None:
     """Subprocess entry point invoked via ``multiprocessing.Process``.
 
@@ -285,11 +287,12 @@ def _server_main(
     (one pool per reader, drawn on by every encoder /
     ``ReadaheadPipeline``) is drained on the way out.
 
-    ``log_config`` matches the parent's verbosity so the subprocess's
-    own ``logger.debug`` / ``logger.info`` output reaches the same sink
-    as the parent. ``reader_options`` carries the bcftools-style
-    filtering options (regions, samples, …) that vcztools'
-    ``make_reader`` consumes.
+    ``opts`` is the ``vcztools.ViewPlinkOptions`` / ``vcztools.ViewBgenOptions``
+    dataclass parsed from the CLI. Its nested ``log`` field configures
+    logging in the subprocess so its own ``logger.debug`` / ``logger.info``
+    output reaches the same sink as the parent, and its ``make_reader``
+    method opens ``vcz_url`` with the bcftools-style filtering options
+    (regions, samples, …) and the storage / readahead settings.
 
     Any exception raised before ``serve_forever`` starts (reader
     construction, ``_ServerSession`` construction) is caught here so
@@ -302,9 +305,9 @@ def _server_main(
     replies so the parent sees a clean ``OSError`` from
     ``_handshake``.
     """
-    log_config.apply()
+    opts.log.apply()
     try:
-        with vcztools_cli.make_reader_from_options(vcz_url, reader_options) as reader:
+        with opts.make_reader(vcz_url) as reader:
             # Bcftools-style filters (--max-alleles, --types, --include,
             # …) configure a per-variant predicate via
             # ``reader.set_variant_filter``; the format encoders refuse
@@ -313,7 +316,7 @@ def _server_main(
             # encoder sees a plain reader. No-op when no variant filter
             # is configured.
             reader.materialise_variant_filter()
-            session = _ServerSession(reader, spec)
+            session = _ServerSession(reader, spec, opts)
             try:
                 serve_forever(listener_sock, stop_sock, session)
             finally:

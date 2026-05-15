@@ -83,12 +83,15 @@ class EncoderOps(pyfuse3.Operations):
         caller owns the client's lifetime.
     basename
         Stem used for the exposed files: ``{basename}{spec.streaming_suffix}``
-        plus one ``{basename}{suffix}`` per ``spec.static_suffixes`` entry.
+        plus one ``{basename}{suffix}`` per entry of the static-files
+        dict the client received during the metadata handshake.
     spec
         The active :class:`~biofuse.formats.FormatSpec`. Its
-        ``streaming_suffix`` / ``static_suffixes`` drive the inode
-        table; its ``streaming_kind`` is the dispatch key for read
-        routing.
+        ``streaming_suffix`` is exposed as the streaming filename;
+        ``streaming_kind`` is the dispatch key for read routing.
+        The set of static suffixes is read off ``client.static_files``,
+        which is the post-options filtered set the server actually
+        produced.
     max_open_stream
         Maximum number of concurrent open streaming-file fhs. New
         opens block until a peer release frees a slot. Static-file
@@ -130,9 +133,9 @@ class EncoderOps(pyfuse3.Operations):
             (stream_name, spec.streaming_kind, client.stream_size)
         ]
         self._name_to_suffix: dict[str, str] = {}
-        for suffix in spec.static_suffixes:
+        for suffix, body in client.static_files.items():
             name = f"{basename}{suffix}"
-            manifest.append((name, _STATIC_KIND, len(client.static_files[suffix])))
+            manifest.append((name, _STATIC_KIND, len(body)))
             self._name_to_suffix[name] = suffix
         manifest.sort()
 

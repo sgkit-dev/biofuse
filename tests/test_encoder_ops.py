@@ -21,8 +21,15 @@ import pyfuse3
 import pytest
 import trio
 import trio.testing
+import vcztools
 
 from biofuse import access_log, encoder_ops, formats
+
+
+def _default_opts(spec):
+    if spec.name == "plink":
+        return vcztools.ViewPlinkOptions()
+    return vcztools.ViewBgenOptions()
 
 
 class _FakeStreamConnection:
@@ -84,7 +91,7 @@ class _FakeClient:
         if static_files is None:
             static_files = {
                 suffix: b"STATIC" * (32 * (i + 1))
-                for i, suffix in enumerate(spec.static_suffixes)
+                for i, suffix in enumerate(spec.static_suffixes(_default_opts(spec)))
             }
         self.static_files = static_files
         self.stream_size = stream_size
@@ -116,6 +123,11 @@ def fx_spec(request):
 
 
 @pytest.fixture
+def fx_static_suffixes(fx_spec):
+    return fx_spec.static_suffixes(_default_opts(fx_spec))
+
+
+@pytest.fixture
 def fx_client(fx_spec):
     return _FakeClient(fx_spec)
 
@@ -131,13 +143,13 @@ def fx_stream_name(fx_spec):
 
 
 @pytest.fixture
-def fx_first_static_name(fx_spec):
-    return f"small{fx_spec.static_suffixes[0]}"
+def fx_first_static_name(fx_static_suffixes):
+    return f"small{fx_static_suffixes[0]}"
 
 
 @pytest.fixture
-def fx_first_static_bytes(fx_client, fx_spec):
-    return fx_client.static_files[fx_spec.static_suffixes[0]]
+def fx_first_static_bytes(fx_client, fx_static_suffixes):
+    return fx_client.static_files[fx_static_suffixes[0]]
 
 
 async def _expect_fuse_error(coro, expected_errno):
@@ -147,23 +159,25 @@ async def _expect_fuse_error(coro, expected_errno):
 
 
 class TestConstructor:
-    def test_creates_one_inode_per_manifest_entry(self, fx_ops, fx_spec):
-        n_expected = 1 + len(fx_spec.static_suffixes)
+    def test_creates_one_inode_per_manifest_entry(self, fx_ops, fx_static_suffixes):
+        n_expected = 1 + len(fx_static_suffixes)
         assert len(fx_ops._name_to_inode) == n_expected
 
-    def test_basename_propagates_to_all_files(self, fx_client, fx_spec):
+    def test_basename_propagates_to_all_files(
+        self, fx_client, fx_spec, fx_static_suffixes
+    ):
         ops = encoder_ops.EncoderOps(fx_client, "alt", fx_spec)
         expected = sorted(
             [f"alt{fx_spec.streaming_suffix}"]
-            + [f"alt{suffix}" for suffix in fx_spec.static_suffixes]
+            + [f"alt{suffix}" for suffix in fx_static_suffixes]
         )
         assert sorted(ops._name_to_inode) == expected
 
-    def test_sizes_match_client_metadata(self, fx_client, fx_spec):
+    def test_sizes_match_client_metadata(self, fx_client, fx_spec, fx_static_suffixes):
         ops = encoder_ops.EncoderOps(fx_client, "small", fx_spec)
         sizes = {ops._inode_to_name[i]: size for i, size in ops._inode_to_size.items()}
         expected = {f"small{fx_spec.streaming_suffix}": fx_client.stream_size}
-        for suffix in fx_spec.static_suffixes:
+        for suffix in fx_static_suffixes:
             expected[f"small{suffix}"] = len(fx_client.static_files[suffix])
         assert sizes == expected
 
@@ -211,7 +225,9 @@ class TestLookup:
 
 
 class TestReaddir:
-    async def test_yields_entries_in_sorted_order(self, fx_ops, fx_spec):
+    async def test_yields_entries_in_sorted_order(
+        self, fx_ops, fx_spec, fx_static_suffixes
+    ):
         emitted: list[tuple[str, int]] = []
 
         class FakeToken:
@@ -231,7 +247,7 @@ class TestReaddir:
             pyfuse3.readdir_reply = original
         expected = sorted(
             [f"small{fx_spec.streaming_suffix}"]
-            + [f"small{suffix}" for suffix in fx_spec.static_suffixes]
+            + [f"small{suffix}" for suffix in fx_static_suffixes]
         )
         assert [n for n, _ in emitted] == expected
 
@@ -395,11 +411,11 @@ class TestRelease:
 
 
 class TestAccessLogger:
-    async def test_records_per_read(self, fx_client, fx_spec):
+    async def test_records_per_read(self, fx_client, fx_spec, fx_static_suffixes):
         log = access_log.AccessLogger()
         ops = encoder_ops.EncoderOps(fx_client, "small", fx_spec, access_logger=log)
         stream_inode = ops._name_to_inode[f"small{fx_spec.streaming_suffix}"]
-        static_inode = ops._name_to_inode[f"small{fx_spec.static_suffixes[0]}"]
+        static_inode = ops._name_to_inode[f"small{fx_static_suffixes[0]}"]
         stream_info = await ops.open(stream_inode, os.O_RDONLY)
         static_info = await ops.open(static_inode, os.O_RDONLY)
         try:
@@ -412,9 +428,7 @@ class TestAccessLogger:
         stream_records = [
             r for r in records if r.path.endswith(fx_spec.streaming_suffix)
         ]
-        static_records = [
-            r for r in records if r.path.endswith(fx_spec.static_suffixes[0])
-        ]
+        static_records = [r for r in records if r.path.endswith(fx_static_suffixes[0])]
         assert len(stream_records) == 1
         assert len(static_records) == 1
         assert stream_records[0].offset == 0
@@ -450,10 +464,12 @@ class TestCapacityLimiter:
         await ops.release(info2.fh)
         await ops.release(third_info[0].fh)
 
-    async def test_static_does_not_block_when_stream_at_cap(self, fx_client, fx_spec):
+    async def test_static_does_not_block_when_stream_at_cap(
+        self, fx_client, fx_spec, fx_static_suffixes
+    ):
         ops = encoder_ops.EncoderOps(fx_client, "small", fx_spec, max_open_stream=1)
         stream_inode = ops._name_to_inode[f"small{fx_spec.streaming_suffix}"]
-        static_inode = ops._name_to_inode[f"small{fx_spec.static_suffixes[0]}"]
+        static_inode = ops._name_to_inode[f"small{fx_static_suffixes[0]}"]
         stream_info = await ops.open(stream_inode, os.O_RDONLY)
         static_info = await ops.open(static_inode, os.O_RDONLY)
         await ops.release(static_info.fh)
@@ -535,10 +551,12 @@ class TestLifecycleEvents:
         assert rel.fh == info.fh
         assert acl.fh == info.fh
 
-    async def test_static_emits_open_and_release_only(self, fx_client, fx_spec):
+    async def test_static_emits_open_and_release_only(
+        self, fx_client, fx_spec, fx_static_suffixes
+    ):
         log = access_log.AccessLogger()
         ops = encoder_ops.EncoderOps(fx_client, "small", fx_spec, access_logger=log)
-        static_inode = ops._name_to_inode[f"small{fx_spec.static_suffixes[0]}"]
+        static_inode = ops._name_to_inode[f"small{fx_static_suffixes[0]}"]
         info = await ops.open(static_inode, os.O_RDONLY)
         await ops.release(info.fh)
         kinds = [r.kind for r in log.records]
@@ -595,9 +613,9 @@ class TestStatfs:
         assert out.f_ffree == 0
         assert out.f_favail == 0
 
-    async def test_reports_manifest_files(self, fx_ops, fx_spec):
+    async def test_reports_manifest_files(self, fx_ops, fx_static_suffixes):
         out = await fx_ops.statfs()
-        assert out.f_files == 1 + len(fx_spec.static_suffixes)
+        assert out.f_files == 1 + len(fx_static_suffixes)
 
     async def test_namemax_is_at_least_posix_min(self, fx_ops):
         out = await fx_ops.statfs()

@@ -24,12 +24,33 @@ class TestHelp:
         assert result.exit_code == 0
         assert "VCZ_URL" in result.output
         assert "MOUNT_DIR" in result.output
+        # The ViewPlinkOptions.decorator pulls in the bcftools-style
+        # filter group + the sidecar toggles.
+        for flag in [
+            "--regions",
+            "--samples",
+            "--max-alleles",
+            "--no-bim",
+            "--no-fam",
+            "--log-level",
+        ]:
+            assert flag in result.output, f"missing {flag} in mount-plink help"
 
     def test_mount_bgen_help(self):
         result = CliRunner().invoke(cli.biofuse_main, ["mount-bgen", "--help"])
         assert result.exit_code == 0
         assert "VCZ_URL" in result.output
         assert "MOUNT_DIR" in result.output
+        for flag in [
+            "--regions",
+            "--samples",
+            "--no-sample-file",
+            "--no-bgi",
+            "--no-header-samples",
+            "--compression-level",
+            "--log-level",
+        ]:
+            assert flag in result.output, f"missing {flag} in mount-bgen help"
 
     def test_version(self):
         result = CliRunner().invoke(cli.biofuse_main, ["--version"])
@@ -197,6 +218,54 @@ class TestEndToEndMount:
             # Two header rows + one row per sample.
             sample_lines = (mnt / "small.sample").read_text().splitlines()
             assert len(sample_lines) == 2 + fx_small_vcz.num_samples
+        finally:
+            self._terminate(proc, mnt)
+
+    def test_plink_no_bim_suppresses_sidecar(self, tmp_path, fx_small_vcz):
+        """``--no-bim`` removes the ``.bim`` sidecar from the mount."""
+        mnt = tmp_path / "mnt"
+        mnt.mkdir()
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "biofuse.cli",
+                "mount-plink",
+                str(fx_small_vcz.path),
+                str(mnt),
+                "--no-bim",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            self._wait_for_mount(mnt, proc, timeout=15)
+            names = sorted(p.name for p in mnt.iterdir())
+            assert names == ["small.bed", "small.fam"]
+        finally:
+            self._terminate(proc, mnt)
+
+    def test_bgen_no_bgi_suppresses_sidecar(self, tmp_path, fx_small_vcz):
+        """``--no-bgi`` removes the ``.bgen.bgi`` sidecar from the mount."""
+        mnt = tmp_path / "mnt"
+        mnt.mkdir()
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "biofuse.cli",
+                "mount-bgen",
+                str(fx_small_vcz.path),
+                str(mnt),
+                "--no-bgi",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            self._wait_for_mount(mnt, proc, timeout=15)
+            names = sorted(p.name for p in mnt.iterdir())
+            assert names == ["small.bgen", "small.sample"]
         finally:
             self._terminate(proc, mnt)
 

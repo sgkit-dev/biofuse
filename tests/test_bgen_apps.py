@@ -16,10 +16,14 @@ import sqlite3
 
 import pytest
 import trio
-from vcztools.bgen import BgenEncoder
-from vcztools.cli import make_reader
+import vcztools
 
 from biofuse import access_log, encoder_client, encoder_ops, formats, fuse_adapter
+
+
+def _open_reader(path) -> object:
+    return vcztools.ViewBgenOptions().make_reader(str(path))
+
 
 PLINK2 = shutil.which("plink2")
 
@@ -74,8 +78,8 @@ async def fx_mounted_bgen(tmp_path, fx_medium_vcz):
 
 
 def _encoder_bytes(vcz_path: pathlib.Path) -> bytes:
-    reader = make_reader(str(vcz_path))
-    with BgenEncoder(reader) as enc:
+    reader = _open_reader(vcz_path)
+    with vcztools.BgenEncoder(reader) as enc:
         return enc.read(0, enc.total_size)
 
 
