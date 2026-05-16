@@ -27,7 +27,7 @@ import trio
 import vcztools
 from vcztools.plink import write_plink
 
-from biofuse import access_log, encoder_client, encoder_ops, formats, fuse_adapter
+from biofuse import access_log, encoder_host, encoder_ops, formats, fuse_adapter
 
 
 def _open_reader(path) -> object:
@@ -74,12 +74,13 @@ async def fx_mounted_plink(tmp_path, fx_medium_vcz):
     write_plink(_open_reader(fx_medium_vcz.path), golden / "medium")
 
     log = access_log.AccessLogger()
-    sock_path = tmp_path / "plink.sock"
-    async with await encoder_client.EncoderClient.start(
-        str(fx_medium_vcz.path), sock_path, formats.PLINK_SPEC
-    ) as client:
+    async with await encoder_host.EncoderHost.start(
+        str(fx_medium_vcz.path),
+        formats.PLINK_SPEC,
+        opts=vcztools.ViewPlinkOptions(),
+    ) as host:
         ops = encoder_ops.EncoderOps(
-            client, "medium", formats.PLINK_SPEC, access_logger=log
+            host, "medium", formats.PLINK_SPEC, access_logger=log
         )
         async with fuse_adapter.mount(ops, str(mnt)):
             await _wait_for_mount(mnt)
@@ -102,11 +103,12 @@ async def _mount_plink(tmp_path, vcz):
     mnt = tmp_path / "mnt"
     mnt.mkdir()
     basename = vcz.path.stem
-    sock_path = tmp_path / "plink.sock"
-    async with await encoder_client.EncoderClient.start(
-        str(vcz.path), sock_path, formats.PLINK_SPEC
-    ) as client:
-        ops = encoder_ops.EncoderOps(client, basename, formats.PLINK_SPEC)
+    async with await encoder_host.EncoderHost.start(
+        str(vcz.path),
+        formats.PLINK_SPEC,
+        opts=vcztools.ViewPlinkOptions(),
+    ) as host:
+        ops = encoder_ops.EncoderOps(host, basename, formats.PLINK_SPEC)
         async with fuse_adapter.mount(ops, str(mnt)):
             await _wait_for_mount(mnt)
             yield mnt, basename

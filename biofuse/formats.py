@@ -1,16 +1,16 @@
-"""Format specs for the encoder-server stack.
+"""Format specs for the encoder-host stack.
 
 A :class:`FormatSpec` bundles everything the format-agnostic
 ``encoder_*`` modules need to serve one output format:
 
 - the suffix of the streaming file (``.bed`` / ``.bgen``),
-- a callable returning the static-sidecar suffixes the parent should
-  expect for a given options dataclass,
+- a callable returning the static-sidecar suffixes the host should
+  produce for a given options dataclass,
 - a builder that produces those static bytes from a ``VczReader`` plus
   options,
 - a factory that constructs one :class:`vcztools.BedEncoder` /
-  :class:`vcztools.BgenEncoder` per server-side connection, also
-  parameterised by the options dataclass.
+  :class:`vcztools.BgenEncoder` per streaming fh, also parameterised
+  by the options dataclass.
 
 Both :class:`vcztools.BedEncoder` and :class:`vcztools.BgenEncoder`
 extend :class:`vcztools.format_encoder.FormatEncoder`, so they share
@@ -23,13 +23,13 @@ The set of static sidecars served by a mount is a function of the
 ``--no-fam`` suppress the corresponding PLINK sidecars, and
 ``--no-sample-file`` / ``--no-bgi`` suppress the BGEN sidecars.
 ``--no-header-samples`` flips ``embed_header_samples=False`` on the
-``BgenEncoder`` so the per-connection ``.bgen`` stream omits the
-sample identifiers from its header block.
+``BgenEncoder`` so the per-fh ``.bgen`` stream omits the sample
+identifiers from its header block.
 
 For BGEN the ``.bgen.bgi`` sidecar is a SQLite database that
 :func:`vcztools.write_bgi` writes to a filesystem path. We materialise
-it to a tempfile at session-init time, read the bytes back, and hold
-them in the server process's memory alongside the ``.sample`` text.
+it to a tempfile at host startup, read the bytes back, and hold them
+in the host's memory alongside the ``.sample`` text.
 """
 
 import dataclasses
@@ -43,7 +43,7 @@ import vcztools
 
 @dataclasses.dataclass(frozen=True)
 class FormatSpec:
-    """One output format the encoder-server stack can serve."""
+    """One output format the encoder-host stack can serve."""
 
     name: str
     """Short identifier used in CLI / log lines (``"plink"`` / ``"bgen"``)."""
@@ -69,7 +69,7 @@ class FormatSpec:
 
     encoder_factory: Callable
     """``(reader, opts) -> FormatEncoder``: construct one fresh encoder
-    for one server connection, parameterised by ``opts``."""
+    for one streaming fh, parameterised by ``opts``."""
 
 
 def _plink_static_suffixes(opts) -> tuple[str, ...]:
