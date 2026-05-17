@@ -9,6 +9,7 @@ every PR.
 | Category | Runner | Approx runtime |
 |---|---|---|
 | POSIX syscall semantics | native Python | ~10 s |
+| Bulk-data cross-validation | native Python | ~15 s |
 | pjdfstest curated subset | external (`pjdfstest`) | ~30–60 s |
 | Read-pattern stress | external (`fio`) | ~4 min |
 | Read cross-validation | native Python (fsx-style) | ~30 s |
@@ -124,6 +125,14 @@ loops foreground probes — `readdir` plus 4 KB reads of `.bim` and
 that mount-level operations and static-file reads stay responsive even
 while the streaming file is saturated. The streaming file itself is
 *not* probed: that is the load.
+
+**Bulk-data cross-validation.** The `bulk-data` runner mounts the
+fixture VCZ once as plink and once as BGEN, reads up to 100 MB from
+each streaming file (`.bed` / `.bgen`) on the mount, and compares the
+bytes against the same prefix produced by `vcztools.BedEncoder` /
+`vcztools.BgenEncoder` run directly in-process. The cap keeps memory
+bounded when the encoder's `total_size` exceeds 100 MB; smaller
+streams are compared in full.
 
 **fsx is read-only mode only.** Apple/LTP/xfstests fsx all assume a
 writable filesystem (they bootstrap the in-memory model by writing to
