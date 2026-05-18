@@ -7,6 +7,7 @@ shared :class:`VczReader` under a given options dataclass, and each
 the same selection.
 """
 
+import dataclasses
 import io
 import sqlite3
 import tempfile
@@ -339,6 +340,94 @@ class TestBgenUnphasedToggle:
         with vcztools.BgenEncoder(ref_reader, unphased=False) as ref:
             ref_data = ref.read(0, ref.total_size)
         assert data == ref_data
+
+
+class TestBgenTotalStringLengthPlumbing:
+    """``--total-string-length`` flows through to ``BgenEncoder``.
+
+    Compared against an in-process ``BgenEncoder`` built with the same
+    kwarg, the streamed bytes must be identical.
+    """
+
+    def test_default_matches_in_process(self, fx_reader, fx_small_vcz):
+        opts = vcztools.ViewBgenOptions()
+        assert opts.total_string_length is None
+        with formats.BGEN_SPEC.encoder_factory(fx_reader, opts) as encoder:
+            data = encoder.read(0, encoder.total_size)
+        ref_reader = _open_reader(fx_small_vcz.path)
+        with vcztools.BgenEncoder(ref_reader) as ref:
+            ref_data = ref.read(0, ref.total_size)
+        assert data == ref_data
+
+    def test_explicit_value_matches_in_process(self, fx_reader, fx_small_vcz):
+        opts = vcztools.ViewBgenOptions(total_string_length=128)
+        with formats.BGEN_SPEC.encoder_factory(fx_reader, opts) as encoder:
+            data = encoder.read(0, encoder.total_size)
+        ref_reader = _open_reader(fx_small_vcz.path)
+        with vcztools.BgenEncoder(ref_reader, total_string_length=128) as ref:
+            ref_data = ref.read(0, ref.total_size)
+        assert data == ref_data
+
+    def test_budget_too_small_raises(self, fx_reader):
+        opts = vcztools.ViewBgenOptions(total_string_length=1)
+        with pytest.raises(ValueError, match="total_string_length"):
+            with formats.BGEN_SPEC.encoder_factory(fx_reader, opts) as encoder:
+                encoder.read(0, encoder.total_size)
+
+
+class TestBgenPadBytePlumbing:
+    """``--pad-byte`` flows through to ``BgenEncoder(pad_byte=...)``."""
+
+    def test_default_matches_in_process(self, fx_reader, fx_small_vcz):
+        opts = vcztools.ViewBgenOptions()
+        assert opts.pad_byte is None
+        with formats.BGEN_SPEC.encoder_factory(fx_reader, opts) as encoder:
+            data = encoder.read(0, encoder.total_size)
+        ref_reader = _open_reader(fx_small_vcz.path)
+        with vcztools.BgenEncoder(ref_reader) as ref:
+            ref_data = ref.read(0, ref.total_size)
+        assert data == ref_data
+
+    def test_explicit_pad_byte_matches_in_process(self, fx_reader, fx_small_vcz):
+        opts = vcztools.ViewBgenOptions(pad_byte=b"X")
+        with formats.BGEN_SPEC.encoder_factory(fx_reader, opts) as encoder:
+            data = encoder.read(0, encoder.total_size)
+        ref_reader = _open_reader(fx_small_vcz.path)
+        with vcztools.BgenEncoder(ref_reader, pad_byte=b"X") as ref:
+            ref_data = ref.read(0, ref.total_size)
+        assert data == ref_data
+
+    def test_pad_byte_changes_bytes(self, fx_reader):
+        opts_default = vcztools.ViewBgenOptions()
+        opts_x = vcztools.ViewBgenOptions(pad_byte=b"X")
+        with formats.BGEN_SPEC.encoder_factory(fx_reader, opts_default) as encoder:
+            data_default = encoder.read(0, encoder.total_size)
+        with formats.BGEN_SPEC.encoder_factory(fx_reader, opts_x) as encoder:
+            data_x = encoder.read(0, encoder.total_size)
+        assert data_default != data_x
+
+
+class TestViewBgenOptionsShim:
+    """Locks the temporary monkeypatch in ``biofuse/_vcztools_compat.py``.
+
+    Delete this class when the upstream vcztools fields land.
+    """
+
+    def test_fields_are_present(self):
+        names = {f.name for f in dataclasses.fields(vcztools.ViewBgenOptions)}
+        assert {"total_string_length", "pad_byte"} <= names
+
+    def test_default_values(self):
+        opts = vcztools.ViewBgenOptions()
+        assert opts.total_string_length is None
+        assert opts.pad_byte is None
+
+    def test_unset_kwargs_preserve_base_fields(self):
+        opts = vcztools.ViewBgenOptions(no_header_samples=True, unphased=True)
+        assert opts.no_header_samples is True
+        assert opts.unphased is True
+        assert opts.total_string_length is None
+        assert opts.pad_byte is None
 
 
 class TestSpecsRegistry:

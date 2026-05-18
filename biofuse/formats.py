@@ -129,10 +129,13 @@ def _plink_encoder_factory(reader, opts):
 
 
 def _bgen_encoder_factory(reader, opts):
+    embed_header_samples = not opts.no_header_samples
     return vcztools.BgenEncoder(
         reader,
-        embed_header_samples=not opts.no_header_samples,
+        embed_header_samples=embed_header_samples,
         unphased=opts.unphased,
+        total_string_length=opts.total_string_length,
+        pad_byte=opts.pad_byte,
     )
 
 
