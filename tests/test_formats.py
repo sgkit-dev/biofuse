@@ -1,6 +1,6 @@
 """Tests for biofuse.formats — the per-format spec table.
 
-Pins the duck-typed contract that ``encoder_server`` / ``encoder_ops``
+Pins the duck-typed contract that ``encoder_host`` / ``encoder_ops``
 rely on: each spec produces the expected static sidecar bytes for the
 shared :class:`VczReader` under a given options dataclass, and each
 ``encoder_factory`` yields an encoder whose ``total_size`` reflects

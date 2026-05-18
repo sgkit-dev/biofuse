@@ -9,6 +9,7 @@ import sys
 import click
 
 from . import (
+    bulk_data_runner,
     fio_runner,
     fsx_runner,
     lifecycle,
@@ -227,6 +228,18 @@ def fsx_cmd(ctx: click.Context, ops: int, max_op_size: int) -> None:
     sys.exit(_emit(results_dir, [result]))
 
 
+@main.command("bulk-data")
+@click.pass_context
+def bulk_data_cmd(ctx: click.Context) -> None:
+    """Cross-validate mount bytes against direct-encoder bytes (plink + bgen)."""
+    results_dir = ctx.obj["results_dir"]
+    log_dir = _runner_log_dir(results_dir, "bulk-data")
+    result = _run_with_banner(
+        "bulk-data", lambda: bulk_data_runner.run(log_dir=log_dir)
+    )
+    sys.exit(_emit(results_dir, [result]))
+
+
 @main.command("lifecycle")
 @click.option("--iterations", type=int, default=50)
 @click.pass_context
@@ -272,12 +285,16 @@ def all_cmd(ctx: click.Context) -> None:
     pjd_log_dir = _runner_log_dir(results_dir, "pjdfstest")
     fio_log_dir = _runner_log_dir(results_dir, "fio")
     fsx_log_dir = _runner_log_dir(results_dir, "fsx")
+    bulk_data_log_dir = _runner_log_dir(results_dir, "bulk-data")
     stress_log_dir = _runner_log_dir(results_dir, "stress-ng")
     lifecycle_log_dir = _runner_log_dir(results_dir, "lifecycle")
     liveness_log_dir = _runner_log_dir(results_dir, "active-under-stress")
 
     results: list[tools.RunnerResult] = [
-        _run_with_banner("posix", lambda: posix.run(log_path=posix_log))
+        _run_with_banner("posix", lambda: posix.run(log_path=posix_log)),
+        _run_with_banner(
+            "bulk-data", lambda: bulk_data_runner.run(log_dir=bulk_data_log_dir)
+        ),
     ]
     if not quick:
         results.append(

@@ -1,10 +1,9 @@
 """End-to-end tests for BGEN mounts.
 
-Mirrors :mod:`test_plink_apps`: mount a VCZ as a BGEN fileset via the
-real encoder-server subprocess, then read the mounted files. Where
-``plink2`` is on PATH, ``TestPlinkTwo`` also exercises the mount as a
-BGEN reader and compares its output to a side-by-side copy of the
-encoder's bytes.
+Mirrors :mod:`test_plink_apps`: mount a VCZ as a BGEN fileset, then
+read the mounted files. Where ``plink2`` is on PATH, ``TestPlinkTwo``
+also exercises the mount as a BGEN reader and compares its output to
+a side-by-side copy of the encoder's bytes.
 """
 
 import contextlib
@@ -19,7 +18,7 @@ import pytest
 import trio
 import vcztools
 
-from biofuse import access_log, encoder_client, encoder_ops, formats, fuse_adapter
+from biofuse import access_log, encoder_host, encoder_ops, formats, fuse_adapter
 
 
 def _open_reader(path) -> object:
@@ -66,12 +65,13 @@ async def fx_mounted_bgen(tmp_path, fx_medium_vcz):
     expected = _encoder_bytes(fx_medium_vcz.path)
 
     log = access_log.AccessLogger()
-    sock_path = tmp_path / "bgen.sock"
-    async with await encoder_client.EncoderClient.start(
-        str(fx_medium_vcz.path), sock_path, formats.BGEN_SPEC
-    ) as client:
+    async with await encoder_host.EncoderHost.start(
+        str(fx_medium_vcz.path),
+        formats.BGEN_SPEC,
+        opts=vcztools.ViewBgenOptions(),
+    ) as host:
         ops = encoder_ops.EncoderOps(
-            client, "medium", formats.BGEN_SPEC, access_logger=log
+            host, "medium", formats.BGEN_SPEC, access_logger=log
         )
         async with fuse_adapter.mount(ops, str(mnt)):
             await _wait_for_mount(mnt)
@@ -92,18 +92,21 @@ async def _arun(cmd) -> None:
 async def _mount_bgen(tmp_path, vcz, opts=None):
     """Mount ``vcz`` as a BGEN fileset; yield ``(mnt, basename)``.
 
-    ``opts`` is the ``vcztools.ViewBgenOptions`` dataclass the
-    encoder-server runs under; defaults to a fresh ``ViewBgenOptions()``
-    (every field at its dataclass default).
+    ``opts`` is the ``vcztools.ViewBgenOptions`` dataclass the host
+    runs under; defaults to a fresh ``ViewBgenOptions()`` (every field
+    at its dataclass default).
     """
     mnt = tmp_path / "mnt"
     mnt.mkdir()
     basename = vcz.path.stem
-    sock_path = tmp_path / "bgen.sock"
-    async with await encoder_client.EncoderClient.start(
-        str(vcz.path), sock_path, formats.BGEN_SPEC, opts=opts
-    ) as client:
-        ops = encoder_ops.EncoderOps(client, basename, formats.BGEN_SPEC)
+    if opts is None:
+        opts = vcztools.ViewBgenOptions()
+    async with await encoder_host.EncoderHost.start(
+        str(vcz.path),
+        formats.BGEN_SPEC,
+        opts=opts,
+    ) as host:
+        ops = encoder_ops.EncoderOps(host, basename, formats.BGEN_SPEC)
         async with fuse_adapter.mount(ops, str(mnt)):
             await _wait_for_mount(mnt)
             yield mnt, basename

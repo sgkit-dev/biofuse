@@ -6,21 +6,18 @@ Generic over the output format (PLINK 1.9 / Oxford BGEN). The active
 - the streaming file suffix (``.bed`` / ``.bgen``) and its
   ``streaming_kind`` dispatch key;
 - the static-sidecar suffixes (``.bim``/``.fam`` for PLINK,
-  ``.sample``/``.bgen.bgi`` for BGEN), served from cached bytes the
-  client fetched once at mount time.
+  ``.sample``/``.bgen.bgi`` for BGEN), built once at mount time and
+  held in the host's memory.
 
-The static-sidecar bytes are fetched once at mount time and held in
-memory by the FUSE adapter; reads against them are served directly
-from the cached bytes without crossing process boundaries.
-
-Each streaming-file ``open()`` from the kernel allocates a fresh
-:class:`biofuse.encoder_client.StreamConnection` — a dedicated socket
-to the encoder-server subprocess, where one server thread with one
-encoder runs synchronously for the lifetime of the connection.
-``read()`` on that fh forwards straight to the per-fh socket; the
+Static-sidecar reads are served directly from the cached bytes. Each
+streaming-file ``open()`` from the kernel allocates a fresh
+:class:`biofuse.encoder_host.StreamHandle` — a dedicated
+:class:`~vcztools.format_encoder.FormatEncoder` whose blocking work
+runs on worker threads via :func:`trio.to_thread.run_sync`, leaving
+the pyfuse3 trio task free for other FUSE requests. ``read()`` on
+that fh dispatches one ``encoder.read`` call per request; the
 kernel's parallel readahead requests on a single fh serialise on the
-``StreamConnection``'s internal lock. ``release()`` closes the socket;
-the server thread sees EOF and exits.
+``StreamHandle``'s internal lock. ``release()`` closes the encoder.
 """
 
 import errno
@@ -53,23 +50,23 @@ _LIMITER_TIMEOUT_S = 30.0
 _STATIC_KIND = "static"
 
 
-class _StreamConnectionProto(Protocol):
+class _StreamHandleProto(Protocol):
     async def read(self, off: int, size: int) -> bytes: ...
     async def aclose(self) -> None: ...
 
 
-class EncoderClientProto(Protocol):
-    """The slice of :class:`biofuse.encoder_client.EncoderClient` that
+class EncoderHostProto(Protocol):
+    """The slice of :class:`biofuse.encoder_host.EncoderHost` that
     :class:`EncoderOps` depends on.
 
-    Defined as a Protocol so tests can inject a fake without spawning
-    a subprocess.
+    Defined as a Protocol so tests can inject a fake without opening
+    a real reader.
     """
 
     static_files: dict[str, bytes]
     stream_size: int
 
-    async def open_stream(self) -> _StreamConnectionProto: ...
+    async def open_stream(self) -> _StreamHandleProto: ...
 
 
 class EncoderOps(pyfuse3.Operations):
@@ -77,20 +74,20 @@ class EncoderOps(pyfuse3.Operations):
 
     Parameters
     ----------
-    client
-        An :class:`EncoderClient` already past its metadata handshake
-        (or any object satisfying :class:`EncoderClientProto`). The
-        caller owns the client's lifetime.
+    host
+        An :class:`~biofuse.encoder_host.EncoderHost` whose ``start``
+        has populated ``static_files`` and ``stream_size`` (or any
+        object satisfying :class:`EncoderHostProto`). The caller owns
+        the host's lifetime.
     basename
         Stem used for the exposed files: ``{basename}{spec.streaming_suffix}``
-        plus one ``{basename}{suffix}`` per entry of the static-files
-        dict the client received during the metadata handshake.
+        plus one ``{basename}{suffix}`` per entry of ``host.static_files``.
     spec
         The active :class:`~biofuse.formats.FormatSpec`. Its
         ``streaming_suffix`` is exposed as the streaming filename;
         ``streaming_kind`` is the dispatch key for read routing.
-        The set of static suffixes is read off ``client.static_files``,
-        which is the post-options filtered set the server actually
+        The set of static suffixes is read off ``host.static_files``,
+        which is the post-options filtered set the host actually
         produced.
     max_open_stream
         Maximum number of concurrent open streaming-file fhs. New
@@ -106,7 +103,7 @@ class EncoderOps(pyfuse3.Operations):
 
     def __init__(
         self,
-        client: EncoderClientProto,
+        host: EncoderHostProto,
         basename: str,
         spec: formats.FormatSpec,
         *,
@@ -114,7 +111,7 @@ class EncoderOps(pyfuse3.Operations):
         access_logger: access_log_mod.AccessLogger | None = None,
     ) -> None:
         super().__init__()
-        self._client = client
+        self._host = host
         self._basename = basename
         self._spec = spec
         self._access_logger = access_logger
@@ -127,13 +124,13 @@ class EncoderOps(pyfuse3.Operations):
         # the streaming file's kind is the spec's ``streaming_kind``;
         # all static files share the same ``_STATIC_KIND`` dispatch key.
         # ``_name_to_suffix`` maps each static filename to its suffix
-        # for lookups into ``client.static_files``.
+        # for lookups into ``host.static_files``.
         stream_name = f"{basename}{spec.streaming_suffix}"
         manifest: list[tuple[str, str, int]] = [
-            (stream_name, spec.streaming_kind, client.stream_size)
+            (stream_name, spec.streaming_kind, host.stream_size)
         ]
         self._name_to_suffix: dict[str, str] = {}
-        for suffix, body in client.static_files.items():
+        for suffix, body in host.static_files.items():
             name = f"{basename}{suffix}"
             manifest.append((name, _STATIC_KIND, len(body)))
             self._name_to_suffix[name] = suffix
@@ -153,7 +150,7 @@ class EncoderOps(pyfuse3.Operations):
         self._next_fh = 1
         self._fh_to_kind: dict[int, str] = {}
         self._fh_to_name: dict[int, str] = {}
-        self._fh_to_conn: dict[int, _StreamConnectionProto] = {}
+        self._fh_to_conn: dict[int, _StreamHandleProto] = {}
 
     def _build_attrs(self, inode: int) -> pyfuse3.EntryAttributes:
         attrs = pyfuse3.EntryAttributes()
@@ -234,7 +231,7 @@ class EncoderOps(pyfuse3.Operations):
             self._record_event("limiter_wait", name, fh, t_limiter_start, t_limiter_end)
             try:
                 on_aclose = self._make_aclose_recorder(name, fh)
-                conn = await self._client.open_stream(on_aclose=on_aclose)
+                conn = await self._host.open_stream(on_aclose=on_aclose)
             except OSError as exc:
                 self._stream_limiter.release_on_behalf_of(fh)
                 raise pyfuse3.FUSEError(exc.errno or errno.EIO) from exc
@@ -272,7 +269,7 @@ class EncoderOps(pyfuse3.Operations):
         t_start = time.monotonic()
         if kind == _STATIC_KIND:
             suffix = self._name_to_suffix[name]
-            data = self._read_static(self._client.static_files[suffix], off, size)
+            data = self._read_static(self._host.static_files[suffix], off, size)
         elif kind == self._spec.streaming_kind:
             assert conn is not None
             try:

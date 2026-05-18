@@ -1,11 +1,10 @@
 """Unit tests for EncoderOps.
 
 Exercises the streaming Operations class via direct async-method calls
-— no kernel mount, no subprocess. The vcztools/Zarr-side parity tests
-live in ``test_encoder_server.py`` (against the server module directly)
-and in ``test_encoder_client.py`` (against a real subprocess). End-to-end
-FUSE behaviour against real plink / bgenix binaries lives in
-``test_plink_apps.py`` / ``test_bgen_apps.py``.
+— no kernel mount, no real encoder. The vcztools/Zarr-side parity
+tests live in ``test_encoder_host.py``. End-to-end FUSE behaviour
+against real plink / bgenix binaries lives in ``test_plink_apps.py``
+/ ``test_bgen_apps.py``.
 
 Tests parametrise over both :data:`biofuse.formats.PLINK_SPEC` and
 :data:`biofuse.formats.BGEN_SPEC` so the spec-driven inode table and
@@ -32,9 +31,9 @@ def _default_opts(spec):
     return vcztools.ViewBgenOptions()
 
 
-class _FakeStreamConnection:
+class _FakeStreamHandle:
     """In-process stand-in for
-    :class:`biofuse.encoder_client.StreamConnection`.
+    :class:`biofuse.encoder_host.StreamHandle`.
 
     Records the call sequence so tests can assert EncoderOps dispatched
     correctly. Reads return deterministic bytes derived from
@@ -74,11 +73,11 @@ class _FakeStreamConnection:
             self._on_aclose(t0, time.monotonic())
 
 
-class _FakeClient:
-    """In-process stand-in for :class:`biofuse.encoder_client.EncoderClient`.
+class _FakeHost:
+    """In-process stand-in for :class:`biofuse.encoder_host.EncoderHost`.
 
     Holds canned ``static_files`` / ``stream_size`` and hands out
-    :class:`_FakeStreamConnection` instances on demand.
+    :class:`_FakeStreamHandle` instances on demand.
     """
 
     def __init__(
@@ -98,20 +97,18 @@ class _FakeClient:
         self.calls: list[tuple] = []
         self._next_open_error: OSError | None = None
         self._next_conn_id = 1
-        self.connections: list[_FakeStreamConnection] = []
+        self.connections: list[_FakeStreamHandle] = []
 
     def raise_on_next_open(self, exc: OSError) -> None:
         self._next_open_error = exc
 
-    async def open_stream(self, *, on_aclose=None) -> _FakeStreamConnection:
+    async def open_stream(self, *, on_aclose=None) -> _FakeStreamHandle:
         self.calls.append(("open_stream",))
         if self._next_open_error is not None:
             exc = self._next_open_error
             self._next_open_error = None
             raise exc
-        conn = _FakeStreamConnection(
-            self._next_conn_id, self.calls, on_aclose=on_aclose
-        )
+        conn = _FakeStreamHandle(self._next_conn_id, self.calls, on_aclose=on_aclose)
         self._next_conn_id += 1
         self.connections.append(conn)
         return conn
@@ -128,13 +125,13 @@ def fx_static_suffixes(fx_spec):
 
 
 @pytest.fixture
-def fx_client(fx_spec):
-    return _FakeClient(fx_spec)
+def fx_host(fx_spec):
+    return _FakeHost(fx_spec)
 
 
 @pytest.fixture
-def fx_ops(fx_client, fx_spec):
-    return encoder_ops.EncoderOps(fx_client, "small", fx_spec)
+def fx_ops(fx_host, fx_spec):
+    return encoder_ops.EncoderOps(fx_host, "small", fx_spec)
 
 
 @pytest.fixture
@@ -148,8 +145,8 @@ def fx_first_static_name(fx_static_suffixes):
 
 
 @pytest.fixture
-def fx_first_static_bytes(fx_client, fx_static_suffixes):
-    return fx_client.static_files[fx_static_suffixes[0]]
+def fx_first_static_bytes(fx_host, fx_static_suffixes):
+    return fx_host.static_files[fx_static_suffixes[0]]
 
 
 async def _expect_fuse_error(coro, expected_errno):
@@ -164,21 +161,21 @@ class TestConstructor:
         assert len(fx_ops._name_to_inode) == n_expected
 
     def test_basename_propagates_to_all_files(
-        self, fx_client, fx_spec, fx_static_suffixes
+        self, fx_host, fx_spec, fx_static_suffixes
     ):
-        ops = encoder_ops.EncoderOps(fx_client, "alt", fx_spec)
+        ops = encoder_ops.EncoderOps(fx_host, "alt", fx_spec)
         expected = sorted(
             [f"alt{fx_spec.streaming_suffix}"]
             + [f"alt{suffix}" for suffix in fx_static_suffixes]
         )
         assert sorted(ops._name_to_inode) == expected
 
-    def test_sizes_match_client_metadata(self, fx_client, fx_spec, fx_static_suffixes):
-        ops = encoder_ops.EncoderOps(fx_client, "small", fx_spec)
+    def test_sizes_match_client_metadata(self, fx_host, fx_spec, fx_static_suffixes):
+        ops = encoder_ops.EncoderOps(fx_host, "small", fx_spec)
         sizes = {ops._inode_to_name[i]: size for i, size in ops._inode_to_size.items()}
-        expected = {f"small{fx_spec.streaming_suffix}": fx_client.stream_size}
+        expected = {f"small{fx_spec.streaming_suffix}": fx_host.stream_size}
         for suffix in fx_static_suffixes:
-            expected[f"small{suffix}"] = len(fx_client.static_files[suffix])
+            expected[f"small{suffix}"] = len(fx_host.static_files[suffix])
         assert sizes == expected
 
     def test_inodes_assigned_in_sorted_order(self, fx_ops):
@@ -193,20 +190,20 @@ class TestGetattr:
         attrs = await fx_ops.getattr(pyfuse3.ROOT_INODE)
         assert stat.S_ISDIR(attrs.st_mode)
 
-    async def test_streaming_file(self, fx_ops, fx_client, fx_stream_name):
+    async def test_streaming_file(self, fx_ops, fx_host, fx_stream_name):
         inode = fx_ops._name_to_inode[fx_stream_name]
         attrs = await fx_ops.getattr(inode)
         assert stat.S_ISREG(attrs.st_mode)
-        assert attrs.st_size == fx_client.stream_size
+        assert attrs.st_size == fx_host.stream_size
 
     async def test_unknown_inode(self, fx_ops):
         await _expect_fuse_error(fx_ops.getattr(9999), errno.ENOENT)
 
 
 class TestLookup:
-    async def test_known_name(self, fx_ops, fx_client, fx_stream_name):
+    async def test_known_name(self, fx_ops, fx_host, fx_stream_name):
         attrs = await fx_ops.lookup(pyfuse3.ROOT_INODE, fx_stream_name.encode("utf-8"))
-        assert attrs.st_size == fx_client.stream_size
+        assert attrs.st_size == fx_host.stream_size
 
     async def test_unknown_name(self, fx_ops):
         await _expect_fuse_error(
@@ -273,66 +270,66 @@ class TestOpenFlags:
 
 class TestOpenDispatch:
     async def test_stream_open_creates_connection(
-        self, fx_ops, fx_client, fx_spec, fx_stream_name
+        self, fx_ops, fx_host, fx_spec, fx_stream_name
     ):
         inode = fx_ops._name_to_inode[fx_stream_name]
         info = await fx_ops.open(inode, os.O_RDONLY)
         try:
-            assert fx_client.calls == [("open_stream",)]
+            assert fx_host.calls == [("open_stream",)]
             assert fx_ops._fh_to_kind[info.fh] == fx_spec.streaming_kind
             assert info.fh in fx_ops._fh_to_conn
         finally:
             await fx_ops.release(info.fh)
 
     async def test_static_open_does_not_call_client(
-        self, fx_ops, fx_client, fx_first_static_name
+        self, fx_ops, fx_host, fx_first_static_name
     ):
         inode = fx_ops._name_to_inode[fx_first_static_name]
         info = await fx_ops.open(inode, os.O_RDONLY)
         try:
-            assert fx_client.calls == []
+            assert fx_host.calls == []
             assert fx_ops._fh_to_kind[info.fh] == "static"
             assert info.fh not in fx_ops._fh_to_conn
         finally:
             await fx_ops.release(info.fh)
 
     async def test_each_stream_open_gets_distinct_fh_and_connection(
-        self, fx_ops, fx_client, fx_stream_name
+        self, fx_ops, fx_host, fx_stream_name
     ):
         inode = fx_ops._name_to_inode[fx_stream_name]
         info1 = await fx_ops.open(inode, os.O_RDONLY)
         info2 = await fx_ops.open(inode, os.O_RDONLY)
         try:
             assert info1.fh != info2.fh
-            assert len(fx_client.connections) == 2
-            assert fx_client.connections[0] is not fx_client.connections[1]
+            assert len(fx_host.connections) == 2
+            assert fx_host.connections[0] is not fx_host.connections[1]
         finally:
             await fx_ops.release(info1.fh)
             await fx_ops.release(info2.fh)
 
     async def test_stream_open_propagates_oserror_as_fuseerror(
-        self, fx_ops, fx_client, fx_stream_name
+        self, fx_ops, fx_host, fx_stream_name
     ):
-        fx_client.raise_on_next_open(OSError(errno.EACCES, "denied"))
+        fx_host.raise_on_next_open(OSError(errno.EACCES, "denied"))
         inode = fx_ops._name_to_inode[fx_stream_name]
         await _expect_fuse_error(fx_ops.open(inode, os.O_RDONLY), errno.EACCES)
 
 
 class TestRead:
     async def test_stream_read_dispatches_to_connection(
-        self, fx_ops, fx_client, fx_stream_name
+        self, fx_ops, fx_host, fx_stream_name
     ):
         inode = fx_ops._name_to_inode[fx_stream_name]
         info = await fx_ops.open(inode, os.O_RDONLY)
         try:
             data = await fx_ops.read(info.fh, 16, 8)
-            assert ("read", 1, 16, 8) in fx_client.calls
+            assert ("read", 1, 16, 8) in fx_host.calls
             assert data == bytes(((16 + i) & 0xFF) for i in range(8))
         finally:
             await fx_ops.release(info.fh)
 
     async def test_static_read_serves_from_cached_bytes(
-        self, fx_ops, fx_client, fx_first_static_name, fx_first_static_bytes
+        self, fx_ops, fx_host, fx_first_static_name, fx_first_static_bytes
     ):
         inode = fx_ops._name_to_inode[fx_first_static_name]
         info = await fx_ops.open(inode, os.O_RDONLY)
@@ -340,7 +337,7 @@ class TestRead:
             data = await fx_ops.read(info.fh, 0, len(fx_first_static_bytes))
             assert data == fx_first_static_bytes
             # No client traffic for static reads.
-            assert all(c[0] != "read" for c in fx_client.calls)
+            assert all(c[0] != "read" for c in fx_host.calls)
         finally:
             await fx_ops.release(info.fh)
 
@@ -371,12 +368,12 @@ class TestRead:
         await _expect_fuse_error(fx_ops.read(9999, 0, 10), errno.EBADF)
 
     async def test_stream_read_propagates_oserror_as_fuseerror(
-        self, fx_ops, fx_client, fx_stream_name
+        self, fx_ops, fx_host, fx_stream_name
     ):
         inode = fx_ops._name_to_inode[fx_stream_name]
         info = await fx_ops.open(inode, os.O_RDONLY)
         try:
-            fx_client.connections[0].raise_on_next_read(OSError(errno.EIO, "boom"))
+            fx_host.connections[0].raise_on_next_read(OSError(errno.EIO, "boom"))
             await _expect_fuse_error(fx_ops.read(info.fh, 0, 10), errno.EIO)
         finally:
             await fx_ops.release(info.fh)
@@ -384,21 +381,21 @@ class TestRead:
 
 class TestRelease:
     async def test_stream_release_closes_connection(
-        self, fx_ops, fx_client, fx_stream_name
+        self, fx_ops, fx_host, fx_stream_name
     ):
         inode = fx_ops._name_to_inode[fx_stream_name]
         info = await fx_ops.open(inode, os.O_RDONLY)
         await fx_ops.release(info.fh)
-        assert ("aclose", 1) in fx_client.calls
+        assert ("aclose", 1) in fx_host.calls
         assert info.fh not in fx_ops._fh_to_conn
 
     async def test_static_release_does_not_call_client(
-        self, fx_ops, fx_client, fx_first_static_name
+        self, fx_ops, fx_host, fx_first_static_name
     ):
         inode = fx_ops._name_to_inode[fx_first_static_name]
         info = await fx_ops.open(inode, os.O_RDONLY)
         await fx_ops.release(info.fh)
-        assert all(c[0] != "aclose" for c in fx_client.calls)
+        assert all(c[0] != "aclose" for c in fx_host.calls)
 
     async def test_release_unknown_fh_silent(self, fx_ops):
         await fx_ops.release(9999)
@@ -411,9 +408,9 @@ class TestRelease:
 
 
 class TestAccessLogger:
-    async def test_records_per_read(self, fx_client, fx_spec, fx_static_suffixes):
+    async def test_records_per_read(self, fx_host, fx_spec, fx_static_suffixes):
         log = access_log.AccessLogger()
-        ops = encoder_ops.EncoderOps(fx_client, "small", fx_spec, access_logger=log)
+        ops = encoder_ops.EncoderOps(fx_host, "small", fx_spec, access_logger=log)
         stream_inode = ops._name_to_inode[f"small{fx_spec.streaming_suffix}"]
         static_inode = ops._name_to_inode[f"small{fx_static_suffixes[0]}"]
         stream_info = await ops.open(stream_inode, os.O_RDONLY)
@@ -442,8 +439,8 @@ class TestCapacityLimiter:
     streaming-file opens without blocking static reads.
     """
 
-    async def test_stream_blocks_at_cap(self, fx_client, fx_spec):
-        ops = encoder_ops.EncoderOps(fx_client, "small", fx_spec, max_open_stream=2)
+    async def test_stream_blocks_at_cap(self, fx_host, fx_spec):
+        ops = encoder_ops.EncoderOps(fx_host, "small", fx_spec, max_open_stream=2)
         stream_inode = ops._name_to_inode[f"small{fx_spec.streaming_suffix}"]
         info1 = await ops.open(stream_inode, os.O_RDONLY)
         info2 = await ops.open(stream_inode, os.O_RDONLY)
@@ -465,9 +462,9 @@ class TestCapacityLimiter:
         await ops.release(third_info[0].fh)
 
     async def test_static_does_not_block_when_stream_at_cap(
-        self, fx_client, fx_spec, fx_static_suffixes
+        self, fx_host, fx_spec, fx_static_suffixes
     ):
-        ops = encoder_ops.EncoderOps(fx_client, "small", fx_spec, max_open_stream=1)
+        ops = encoder_ops.EncoderOps(fx_host, "small", fx_spec, max_open_stream=1)
         stream_inode = ops._name_to_inode[f"small{fx_spec.streaming_suffix}"]
         static_inode = ops._name_to_inode[f"small{fx_static_suffixes[0]}"]
         stream_info = await ops.open(stream_inode, os.O_RDONLY)
@@ -475,16 +472,16 @@ class TestCapacityLimiter:
         await ops.release(static_info.fh)
         await ops.release(stream_info.fh)
 
-    async def test_failed_open_releases_slot(self, fx_client, fx_spec):
-        ops = encoder_ops.EncoderOps(fx_client, "small", fx_spec, max_open_stream=1)
+    async def test_failed_open_releases_slot(self, fx_host, fx_spec):
+        ops = encoder_ops.EncoderOps(fx_host, "small", fx_spec, max_open_stream=1)
         stream_inode = ops._name_to_inode[f"small{fx_spec.streaming_suffix}"]
-        fx_client.raise_on_next_open(OSError(errno.EACCES, "denied"))
+        fx_host.raise_on_next_open(OSError(errno.EACCES, "denied"))
         await _expect_fuse_error(ops.open(stream_inode, os.O_RDONLY), errno.EACCES)
         info = await ops.open(stream_inode, os.O_RDONLY)
         await ops.release(info.fh)
 
     async def test_open_returns_eagain_when_limiter_starved(
-        self, fx_client, fx_spec, monkeypatch
+        self, fx_host, fx_spec, monkeypatch
     ):
         """A leaked limiter slot must not pin FUSE_OPEN forever.
 
@@ -492,7 +489,7 @@ class TestCapacityLimiter:
         released, a competing open must surface ``EAGAIN`` once the
         per-mount limiter deadline expires."""
         monkeypatch.setattr(encoder_ops, "_LIMITER_TIMEOUT_S", 0.2)
-        ops = encoder_ops.EncoderOps(fx_client, "small", fx_spec, max_open_stream=1)
+        ops = encoder_ops.EncoderOps(fx_host, "small", fx_spec, max_open_stream=1)
         stream_inode = ops._name_to_inode[f"small{fx_spec.streaming_suffix}"]
         held = await ops.open(stream_inode, os.O_RDONLY)
         try:
@@ -501,7 +498,7 @@ class TestCapacityLimiter:
             await ops.release(held.fh)
 
     async def test_limiter_timeout_records_access_event(
-        self, fx_client, fx_spec, monkeypatch
+        self, fx_host, fx_spec, monkeypatch
     ):
         """A timed-out FUSE_OPEN must leave a ``limiter_timeout`` event
         in the access log so post-hoc analysis can attribute an
@@ -510,7 +507,7 @@ class TestCapacityLimiter:
         monkeypatch.setattr(encoder_ops, "_LIMITER_TIMEOUT_S", timeout_s)
         log = access_log.AccessLogger()
         ops = encoder_ops.EncoderOps(
-            fx_client, "small", fx_spec, max_open_stream=1, access_logger=log
+            fx_host, "small", fx_spec, max_open_stream=1, access_logger=log
         )
         stream_inode = ops._name_to_inode[f"small{fx_spec.streaming_suffix}"]
         held = await ops.open(stream_inode, os.O_RDONLY)
@@ -532,9 +529,9 @@ class TestLifecycleEvents:
     are emitted on the access logger so we can localise where time is
     spent in the lifecycle without changing the read trace."""
 
-    async def test_stream_emits_full_lifecycle(self, fx_client, fx_spec):
+    async def test_stream_emits_full_lifecycle(self, fx_host, fx_spec):
         log = access_log.AccessLogger()
-        ops = encoder_ops.EncoderOps(fx_client, "small", fx_spec, access_logger=log)
+        ops = encoder_ops.EncoderOps(fx_host, "small", fx_spec, access_logger=log)
         stream_inode = ops._name_to_inode[f"small{fx_spec.streaming_suffix}"]
         info = await ops.open(stream_inode, os.O_RDONLY)
         await ops.read(info.fh, 0, 8)
@@ -552,10 +549,10 @@ class TestLifecycleEvents:
         assert acl.fh == info.fh
 
     async def test_static_emits_open_and_release_only(
-        self, fx_client, fx_spec, fx_static_suffixes
+        self, fx_host, fx_spec, fx_static_suffixes
     ):
         log = access_log.AccessLogger()
-        ops = encoder_ops.EncoderOps(fx_client, "small", fx_spec, access_logger=log)
+        ops = encoder_ops.EncoderOps(fx_host, "small", fx_spec, access_logger=log)
         static_inode = ops._name_to_inode[f"small{fx_static_suffixes[0]}"]
         info = await ops.open(static_inode, os.O_RDONLY)
         await ops.release(info.fh)
@@ -597,11 +594,9 @@ class TestStatfs:
         out = await fx_ops.statfs()
         assert isinstance(out, pyfuse3.StatvfsData)
 
-    async def test_block_count_matches_sum_of_file_sizes(self, fx_ops, fx_client):
+    async def test_block_count_matches_sum_of_file_sizes(self, fx_ops, fx_host):
         out = await fx_ops.statfs()
-        total = fx_client.stream_size + sum(
-            len(b) for b in fx_client.static_files.values()
-        )
+        total = fx_host.stream_size + sum(len(b) for b in fx_host.static_files.values())
         assert out.f_bsize > 0
         assert out.f_frsize == out.f_bsize
         assert out.f_blocks == (total + out.f_bsize - 1) // out.f_bsize

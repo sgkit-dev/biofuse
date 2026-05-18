@@ -4,14 +4,13 @@ import logging
 import pathlib
 import signal
 import sys
-import tempfile
 from functools import wraps
 
 import click
 import trio
 import vcztools
 
-from biofuse import access_log, encoder_client, encoder_ops, formats, fuse_adapter
+from biofuse import access_log, encoder_host, encoder_ops, formats, fuse_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -76,11 +75,12 @@ def biofuse_main():
 def mount_plink(vcz_url, mount_dir, basename, access_log_path, **kwargs):
     """Mount a PLINK 1.9 view of VCZ_URL at MOUNT_DIR.
 
-    Spawns a plink-server subprocess that owns the ``VczReader`` and
-    serves ``.bed`` reads over an ``AF_UNIX`` socket. ``.bim`` and
-    ``.fam`` are precomputed once at mount time and held in the FUSE
-    process's memory; only ``.bed`` reads cross the wire. ``--no-bim``
-    and ``--no-fam`` suppress the corresponding sidecar from the mount.
+    The FUSE handler owns the ``VczReader`` and one fresh
+    :class:`vcztools.BedEncoder` per open ``.bed`` fh; ``encoder.read``
+    runs on worker threads so the pyfuse3 main loop stays responsive.
+    ``.bim`` and ``.fam`` are precomputed once at mount time and held
+    in memory; only ``.bed`` reads invoke the encoder. ``--no-bim`` and
+    ``--no-fam`` suppress the corresponding sidecar from the mount.
 
     The bcftools-view-style filter / backend / log options are inherited
     from ``vcztools view-plink``; see ``vcztools view-plink --help`` for the
@@ -105,10 +105,11 @@ def mount_plink(vcz_url, mount_dir, basename, access_log_path, **kwargs):
 def mount_bgen(vcz_url, mount_dir, basename, access_log_path, **kwargs):
     """Mount an Oxford BGEN view of VCZ_URL at MOUNT_DIR.
 
-    Spawns a bgen-server subprocess that owns the ``VczReader`` and
-    serves ``.bgen`` reads over an ``AF_UNIX`` socket. ``.sample`` and
-    ``.bgen.bgi`` are precomputed once at mount time and held in the
-    FUSE process's memory; only ``.bgen`` reads cross the wire.
+    The FUSE handler owns the ``VczReader`` and one fresh
+    :class:`vcztools.BgenEncoder` per open ``.bgen`` fh; ``encoder.read``
+    runs on worker threads so the pyfuse3 main loop stays responsive.
+    ``.sample`` and ``.bgen.bgi`` are precomputed once at mount time
+    and held in memory; only ``.bgen`` reads invoke the encoder.
     ``--no-sample-file`` and ``--no-bgi`` suppress the corresponding
     sidecar; ``--no-header-samples`` drops the sample identifiers from
     the ``.bgen`` header block. ``--unphased`` ignores the input's
@@ -144,18 +145,15 @@ def _run_mount(
     log_path = pathlib.Path(access_log_path) if access_log_path is not None else None
     resolved_basename = basename if basename is not None else _default_basename(vcz_url)
 
-    with tempfile.TemporaryDirectory(prefix="biofuse-") as sock_dir:
-        sock_path = pathlib.Path(sock_dir) / f"{spec.name}.sock"
-        trio.run(
-            _amount,
-            spec,
-            vcz_url,
-            str(mount_dir_path),
-            resolved_basename,
-            opts,
-            log_path,
-            sock_path,
-        )
+    trio.run(
+        _amount,
+        spec,
+        vcz_url,
+        str(mount_dir_path),
+        resolved_basename,
+        opts,
+        log_path,
+    )
 
 
 async def _amount(
@@ -165,17 +163,15 @@ async def _amount(
     basename: str,
     opts,
     log_path: pathlib.Path | None,
-    sock_path: pathlib.Path,
 ) -> None:
-    async with await encoder_client.EncoderClient.start(
+    async with await encoder_host.EncoderHost.start(
         vcz_url,
-        sock_path,
         spec,
         opts=opts,
-    ) as client:
+    ) as host:
         with access_log.AccessLogger(log_path) as access_logger:
             ops = encoder_ops.EncoderOps(
-                client, basename, spec, access_logger=access_logger
+                host, basename, spec, access_logger=access_logger
             )
             async with fuse_adapter.mount(ops, mount_dir):
                 click.echo(f"mounted at {mount_dir}", err=True)

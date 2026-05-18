@@ -47,11 +47,12 @@ def force_unmount(mountpoint: pathlib.Path) -> None:
 
 
 class BiofuseMount:
-    """Context manager that runs ``biofuse mount-plink`` in a subprocess.
+    """Context manager that runs ``biofuse mount-<format>`` in a subprocess.
 
     Spawns the real CLI so the harness exercises the same code path a user
     hits. Each mount is its own subprocess, sidestepping pyfuse3's
-    one-mount-per-process limitation entirely.
+    one-mount-per-process limitation entirely. ``format_name`` selects
+    between ``mount-plink`` (default) and ``mount-bgen``.
     """
 
     def __init__(
@@ -59,6 +60,7 @@ class BiofuseMount:
         vcz_url: str,
         mountpoint: pathlib.Path,
         *,
+        format_name: str = "plink",
         basename: str | None = None,
         log_path: pathlib.Path | None = None,
         access_log_path: pathlib.Path | None = None,
@@ -67,6 +69,7 @@ class BiofuseMount:
     ) -> None:
         self.vcz_url = vcz_url
         self.mountpoint = mountpoint
+        self.format_name = format_name
         self.basename = basename
         self.log_path = log_path
         self.access_log_path = access_log_path
@@ -85,7 +88,7 @@ class BiofuseMount:
             )
         cmd: list[str] = [
             biofuse_bin,
-            "mount-plink",
+            f"mount-{self.format_name}",
             self.vcz_url,
             str(self.mountpoint),
         ]
