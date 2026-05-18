@@ -83,6 +83,14 @@ class StreamHandle:
     async def read(self, off: int, size: int) -> bytes:
         if self._closed:
             raise OSError(errno.EIO, "stream handle is closed")
+        # Fast path: serve from the encoder's in-memory cache without
+        # taking the lock or dispatching to a worker thread.
+        # ``try_cached_read`` is documented thread-safe and never
+        # advances the iterator, so it is safe to call concurrently
+        # with an in-flight slow-path ``encoder.read`` on another task.
+        cached = self._encoder.try_cached_read(off, size)
+        if cached is not None:
+            return cached
         async with self._lock:
             if self._closed:
                 raise OSError(errno.EIO, "stream handle is closed")
