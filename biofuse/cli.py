@@ -122,6 +122,27 @@ def mount_bgen(vcz_url, mount_dir, basename, access_log_path, **kwargs):
     fixed-size blocks) so byte-range random access into the mounted
     ``.bgen`` is O(1).
 
+    BGEN tuning parameters:
+
+    \b
+    * ``--total-string-length`` (default 64) is the combined byte budget
+      per variant for the five BGEN string slots (varid + rsid + chrom +
+      allele1 + allele2). Every variant block reserves exactly this many
+      bytes for the string section, which is what makes the mounted
+      ``.bgen`` byte-offset-addressable. The defaults are tuned for
+      biobank biallelic SNP arrays where rsids, single-base alleles, and
+      short contig names fit comfortably. Raise it when the input has
+      long indel alleles, long contig names (e.g.
+      ``chrUn_KI270742v1``), or non-rsid variant IDs that would
+      otherwise overflow the budget — if any variant's actual string
+      content sums past ``total_string_length - 1`` the encoder raises
+      a ``ValueError`` at read time.
+    * ``--pad-byte`` (default ``.``) fills the slack inside each
+      variant's padding string after the leading ``.``. The default
+      makes the padding indistinguishable from the leading delimiter;
+      override it (e.g. ``--pad-byte X``) only when you want the
+      boundary visible in a hex dump for debugging.
+
     The mount runs in the foreground until interrupted with Ctrl-C.
     """
     opts = vcztools.ViewBgenOptions.from_click_kwargs(kwargs)
