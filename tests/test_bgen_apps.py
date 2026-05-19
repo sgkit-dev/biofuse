@@ -78,9 +78,18 @@ async def fx_mounted_bgen(tmp_path, fx_medium_vcz):
             yield mnt, "medium", expected, log
 
 
-def _encoder_bytes(vcz_path: pathlib.Path) -> bytes:
+def _encoder_bytes(
+    vcz_path: pathlib.Path,
+    *,
+    total_string_length: int | None = None,
+    pad_byte: bytes | None = None,
+) -> bytes:
     reader = _open_reader(vcz_path)
-    with vcztools.BgenEncoder(reader) as enc:
+    with vcztools.BgenEncoder(
+        reader,
+        total_string_length=total_string_length,
+        pad_byte=pad_byte,
+    ) as enc:
         return enc.read(0, enc.total_size)
 
 
@@ -89,14 +98,16 @@ async def _arun(cmd) -> None:
 
 
 @contextlib.asynccontextmanager
-async def _mount_bgen(tmp_path, vcz, opts=None):
+async def _mount_bgen(tmp_path, vcz, opts=None, *, mnt_name="mnt"):
     """Mount ``vcz`` as a BGEN fileset; yield ``(mnt, basename)``.
 
     ``opts`` is the ``vcztools.ViewBgenOptions`` dataclass the host
     runs under; defaults to a fresh ``ViewBgenOptions()`` (every field
-    at its dataclass default).
+    at its dataclass default). ``mnt_name`` lets a single test mount
+    twice under the same ``tmp_path`` without colliding on the
+    mountpoint directory.
     """
-    mnt = tmp_path / "mnt"
+    mnt = tmp_path / mnt_name
     mnt.mkdir()
     basename = vcz.path.stem
     if opts is None:
@@ -197,6 +208,41 @@ class TestBgenOptionsAcrossOpens:
             for cycle in range(3):
                 data = await trio.to_thread.run_sync(bgen_path.read_bytes)
                 assert data == expected, f"cycle {cycle} differed from reference"
+
+
+class TestBgenCustomStringPadding:
+    """End-to-end coverage that ``--total-string-length`` /
+    ``--pad-byte`` reach the FUSE-served bytes.
+    """
+
+    async def test_full_bgen_with_custom_budget(self, tmp_path, fx_small_vcz):
+        opts = vcztools.ViewBgenOptions(total_string_length=128, pad_byte=b"X")
+        expected = _encoder_bytes(
+            fx_small_vcz.path, total_string_length=128, pad_byte=b"X"
+        )
+        async with _mount_bgen(tmp_path, fx_small_vcz, opts=opts) as (mnt, basename):
+            bgen_path = mnt / f"{basename}.bgen"
+            data = await trio.to_thread.run_sync(bgen_path.read_bytes)
+            assert data == expected
+
+    async def test_bytes_differ_from_default(self, tmp_path, fx_small_vcz):
+        opts_x = vcztools.ViewBgenOptions(pad_byte=b"X")
+        async with _mount_bgen(
+            tmp_path, fx_small_vcz, opts=opts_x, mnt_name="mnt_x"
+        ) as (mnt, basename):
+            data_x = await trio.to_thread.run_sync(
+                (mnt / f"{basename}.bgen").read_bytes
+            )
+
+        opts_default = vcztools.ViewBgenOptions()
+        async with _mount_bgen(
+            tmp_path, fx_small_vcz, opts=opts_default, mnt_name="mnt_default"
+        ) as (mnt, basename):
+            data_default = await trio.to_thread.run_sync(
+                (mnt / f"{basename}.bgen").read_bytes
+            )
+
+        assert data_default != data_x
 
 
 def _pread_sync(path: pathlib.Path, off: int, size: int) -> bytes:

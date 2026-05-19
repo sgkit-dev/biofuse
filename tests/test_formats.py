@@ -341,6 +341,71 @@ class TestBgenUnphasedToggle:
         assert data == ref_data
 
 
+class TestBgenTotalStringLengthPlumbing:
+    """``--total-string-length`` flows through to ``BgenEncoder``.
+
+    Compared against an in-process ``BgenEncoder`` built with the same
+    kwarg, the streamed bytes must be identical.
+    """
+
+    def test_default_matches_in_process(self, fx_reader, fx_small_vcz):
+        opts = vcztools.ViewBgenOptions()
+        assert opts.total_string_length is None
+        with formats.BGEN_SPEC.encoder_factory(fx_reader, opts) as encoder:
+            data = encoder.read(0, encoder.total_size)
+        ref_reader = _open_reader(fx_small_vcz.path)
+        with vcztools.BgenEncoder(ref_reader) as ref:
+            ref_data = ref.read(0, ref.total_size)
+        assert data == ref_data
+
+    def test_explicit_value_matches_in_process(self, fx_reader, fx_small_vcz):
+        opts = vcztools.ViewBgenOptions(total_string_length=128)
+        with formats.BGEN_SPEC.encoder_factory(fx_reader, opts) as encoder:
+            data = encoder.read(0, encoder.total_size)
+        ref_reader = _open_reader(fx_small_vcz.path)
+        with vcztools.BgenEncoder(ref_reader, total_string_length=128) as ref:
+            ref_data = ref.read(0, ref.total_size)
+        assert data == ref_data
+
+    def test_budget_too_small_raises(self, fx_reader):
+        opts = vcztools.ViewBgenOptions(total_string_length=1)
+        with pytest.raises(ValueError, match="total_string_length"):
+            with formats.BGEN_SPEC.encoder_factory(fx_reader, opts) as encoder:
+                encoder.read(0, encoder.total_size)
+
+
+class TestBgenPadBytePlumbing:
+    """``--pad-byte`` flows through to ``BgenEncoder(pad_byte=...)``."""
+
+    def test_default_matches_in_process(self, fx_reader, fx_small_vcz):
+        opts = vcztools.ViewBgenOptions()
+        assert opts.pad_byte is None
+        with formats.BGEN_SPEC.encoder_factory(fx_reader, opts) as encoder:
+            data = encoder.read(0, encoder.total_size)
+        ref_reader = _open_reader(fx_small_vcz.path)
+        with vcztools.BgenEncoder(ref_reader) as ref:
+            ref_data = ref.read(0, ref.total_size)
+        assert data == ref_data
+
+    def test_explicit_pad_byte_matches_in_process(self, fx_reader, fx_small_vcz):
+        opts = vcztools.ViewBgenOptions(pad_byte=b"X")
+        with formats.BGEN_SPEC.encoder_factory(fx_reader, opts) as encoder:
+            data = encoder.read(0, encoder.total_size)
+        ref_reader = _open_reader(fx_small_vcz.path)
+        with vcztools.BgenEncoder(ref_reader, pad_byte=b"X") as ref:
+            ref_data = ref.read(0, ref.total_size)
+        assert data == ref_data
+
+    def test_pad_byte_changes_bytes(self, fx_reader):
+        opts_default = vcztools.ViewBgenOptions()
+        opts_x = vcztools.ViewBgenOptions(pad_byte=b"X")
+        with formats.BGEN_SPEC.encoder_factory(fx_reader, opts_default) as encoder:
+            data_default = encoder.read(0, encoder.total_size)
+        with formats.BGEN_SPEC.encoder_factory(fx_reader, opts_x) as encoder:
+            data_x = encoder.read(0, encoder.total_size)
+        assert data_default != data_x
+
+
 class TestSpecsRegistry:
     def test_specs_dict_has_both_entries(self):
         assert formats.SPECS == {"plink": formats.PLINK_SPEC, "bgen": formats.BGEN_SPEC}

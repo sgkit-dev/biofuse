@@ -54,6 +54,8 @@ class TestHelp:
             "--no-sample-file",
             "--no-bgi",
             "--no-header-samples",
+            "--total-string-length",
+            "--pad-byte",
             "--log-level",
         ]:
             assert flag in result.output, f"missing {flag} in mount-bgen help"
@@ -94,6 +96,47 @@ class TestArgumentValidation:
         )
         assert result.exit_code != 0
         assert "mount directory does not exist" in result.output
+
+
+class TestMountBgenStringOptions:
+    """Parse-time validation of ``--total-string-length`` / ``--pad-byte``.
+
+    The CLI rejects malformed values before any FUSE mount is
+    attempted, so these tests stay in-process.
+    """
+
+    def test_pad_byte_rejects_multichar(self, tmp_path):
+        result = CliRunner().invoke(
+            cli.biofuse_main,
+            ["mount-bgen", "--pad-byte", "XX", "x.vcz", str(tmp_path)],
+        )
+        assert result.exit_code != 0
+        assert "single ASCII character" in result.output
+
+    def test_pad_byte_rejects_non_ascii(self, tmp_path):
+        # Upstream's --pad-byte callback uses errors="strict", so a
+        # non-ASCII character surfaces as a UnicodeEncodeError rather
+        # than a click.BadParameter — only the non-zero exit is stable.
+        result = CliRunner().invoke(
+            cli.biofuse_main,
+            ["mount-bgen", "--pad-byte", "é", "x.vcz", str(tmp_path)],
+        )
+        assert result.exit_code != 0
+
+    def test_pad_byte_rejects_empty(self, tmp_path):
+        result = CliRunner().invoke(
+            cli.biofuse_main,
+            ["mount-bgen", "--pad-byte", "", "x.vcz", str(tmp_path)],
+        )
+        assert result.exit_code != 0
+        assert "single ASCII character" in result.output
+
+    def test_total_string_length_rejects_zero(self, tmp_path):
+        result = CliRunner().invoke(
+            cli.biofuse_main,
+            ["mount-bgen", "--total-string-length", "0", "x.vcz", str(tmp_path)],
+        )
+        assert result.exit_code != 0
 
 
 class TestEndToEndMount:
