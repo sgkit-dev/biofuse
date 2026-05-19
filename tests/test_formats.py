@@ -7,7 +7,6 @@ shared :class:`VczReader` under a given options dataclass, and each
 the same selection.
 """
 
-import dataclasses
 import io
 import sqlite3
 import tempfile
@@ -405,29 +404,6 @@ class TestBgenPadBytePlumbing:
         with formats.BGEN_SPEC.encoder_factory(fx_reader, opts_x) as encoder:
             data_x = encoder.read(0, encoder.total_size)
         assert data_default != data_x
-
-
-class TestViewBgenOptionsShim:
-    """Locks the temporary monkeypatch in ``biofuse/_vcztools_compat.py``.
-
-    Delete this class when the upstream vcztools fields land.
-    """
-
-    def test_fields_are_present(self):
-        names = {f.name for f in dataclasses.fields(vcztools.ViewBgenOptions)}
-        assert {"total_string_length", "pad_byte"} <= names
-
-    def test_default_values(self):
-        opts = vcztools.ViewBgenOptions()
-        assert opts.total_string_length is None
-        assert opts.pad_byte is None
-
-    def test_unset_kwargs_preserve_base_fields(self):
-        opts = vcztools.ViewBgenOptions(no_header_samples=True, unphased=True)
-        assert opts.no_header_samples is True
-        assert opts.unphased is True
-        assert opts.total_string_length is None
-        assert opts.pad_byte is None
 
 
 class TestSpecsRegistry:
