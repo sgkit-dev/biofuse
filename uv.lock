@@ -108,7 +108,7 @@ requires-dist = [
     { name = "click", specifier = ">=8.2.0" },
     { name = "pyfuse3", specifier = ">=3.4.0" },
     { name = "trio", specifier = ">=0.22" },
-    { name = "vcztools", git = "https://github.com/sgkit-dev/vcztools.git?rev=main" },
+    { name = "vcztools", specifier = ">=0.2" },
 ]
 
 [package.metadata.requires-dev]
@@ -1627,14 +1627,14 @@ wheels = [
 
 [[package]]
 name = "tqdm"
-version = "4.68.0"
+version = "4.68.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "colorama", marker = "sys_platform == 'win32'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6a/1e/a5e2602851e2a8c49372e3ed4d8437fa43c996941899af7aea6e30173a3d/tqdm-4.68.0.tar.gz", hash = "sha256:c627124266fe7904cabb70e88a940d75a06b889a0b11680307a67c18ce094f19", size = 170209, upload-time = "2026-06-05T13:17:20.095Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/06/b3/36c8ecf72e8925200671613332db156d84b99b3aee742a41c1938ebb0808/tqdm-4.68.1.tar.gz", hash = "sha256:fc163d96b287bd031e1aa24421ce4411b25559bd0a1be4fe649bdaa4d2c02bf5", size = 171236, upload-time = "2026-06-05T17:23:15.267Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c2/51/ab57af723f38a041c5027040fc6fa93a9a066ca7294fc380c1c0810813b2/tqdm-4.68.0-py3-none-any.whl", hash = "sha256:b79a3ae57db4c870a55352e43abb33b329557cd75b1483028909286ff22a2c03", size = 78247, upload-time = "2026-06-05T13:17:18.272Z" },
+    { url = "https://files.pythonhosted.org/packages/47/aa/218a0eb34de1f753c83e4d0d1c8e7c4cef27f20dcb8342e024f63a80dc86/tqdm-4.68.1-py3-none-any.whl", hash = "sha256:fea4a90e4023f764914569f7802a297277c5ab1a66be5144143e142e1a4031d8", size = 78354, upload-time = "2026-06-05T17:23:13.654Z" },
 ]
 
 [[package]]
@@ -1766,8 +1766,8 @@ all = [
 
 [[package]]
 name = "vcztools"
-version = "0.1.3.dev436"
-source = { git = "https://github.com/sgkit-dev/vcztools.git?rev=main#853110bf4b67d9ff0396be35fa9a8d51290dc7c0" }
+version = "0.2.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
     { name = "humanfriendly" },
@@ -1778,6 +1778,21 @@ dependencies = [
     { name = "ruranges-py", marker = "python_full_version >= '3.12'" },
     { name = "zarr", version = "3.1.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "zarr", version = "3.2.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/fa/63/391066ca3a8a7cae30d25074fcb2e3d1368805b1996791833838d714153a/vcztools-0.2.0.tar.gz", hash = "sha256:56a2de4583a1d88e1bcc044d7b76448cb4418fef34b8d98ea241aa79be7f1b5c", size = 898214, upload-time = "2026-06-08T11:40:17.844Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4a/bf/c3f557dcb262b2f0edd0162ef8c881f1cb70b5df49fde0875df2e8ea2e4e/vcztools-0.2.0-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:c5f0405a4aa239df5f4edaffb46bcdcabc488e5b2df697cefa9c232104f05fb7", size = 136710, upload-time = "2026-06-08T11:40:00.977Z" },
+    { url = "https://files.pythonhosted.org/packages/46/2e/ed1a6b1aa35f9328f541ae3b3df750d10840138f56a6547f652f178a46f6/vcztools-0.2.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:028d62b929ef0551046f73e0c14bac24591ead93b1a492a30c6905da077adc1a", size = 136794, upload-time = "2026-06-08T11:40:02.527Z" },
+    { url = "https://files.pythonhosted.org/packages/ce/8d/2d17458f4408450687f3c1032f375c9d2e3329690cb8eccd42ee1f41305a/vcztools-0.2.0-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1bfc23556894e8dcface44dd8f722f38c7e3243992046138f83b1e9bca9707ac", size = 211340, upload-time = "2026-06-08T11:40:03.894Z" },
+    { url = "https://files.pythonhosted.org/packages/15/f2/bfe354f8d9dea2ac9c32c2a56b232be678a8a0454a465f8bd983d6c4fec1/vcztools-0.2.0-cp311-cp311-win_amd64.whl", hash = "sha256:495d3bbf23ac5058125ff5e1cc9262dca1d47588cec96df776e3296be7bec580", size = 136181, upload-time = "2026-06-08T11:40:05.256Z" },
+    { url = "https://files.pythonhosted.org/packages/f8/f4/682c3ee74c2f1f2e5f3c92911e0e127436800bd6a026bdf348abb3524157/vcztools-0.2.0-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:ab7d2c575a4e5587da4f8363a96bea60630c534fd4f18398ef8defea7bdd563f", size = 136811, upload-time = "2026-06-08T11:40:06.69Z" },
+    { url = "https://files.pythonhosted.org/packages/0f/26/582cdcc710efc46aed34958380a09e70a6bb9f84c9c55bc12577eceb37c2/vcztools-0.2.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:b5aa08681f3820f1b96020d263443b0f3edfd7213645af92f9124029f9f2dec7", size = 136852, upload-time = "2026-06-08T11:40:08.081Z" },
+    { url = "https://files.pythonhosted.org/packages/08/18/839dfa0ab847daf764491fdd0f6b4fa3e50bd8d13fa08678ba8724105f25/vcztools-0.2.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:9507d70fbf93713bf8fa61ace58c391c87face9d060c0ea50337366b5e54c92f", size = 211531, upload-time = "2026-06-08T11:40:09.45Z" },
+    { url = "https://files.pythonhosted.org/packages/dd/df/c4128ac1b294ec88b29c61f263be5102b3eaaf560a5f9150d7b7c3e79ac3/vcztools-0.2.0-cp312-cp312-win_amd64.whl", hash = "sha256:03a5475bc1c9f097e7bd9a5d489025873e4744c8c134147830e88cb4c13e163e", size = 136228, upload-time = "2026-06-08T11:40:10.811Z" },
+    { url = "https://files.pythonhosted.org/packages/28/60/5800bd640dae3fc3d408774733b8a44fd75277c70d310ec3c615ec5884cd/vcztools-0.2.0-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:0249bcab5dcea1191f04f28343fae16b6c47960c743be8e9f1e8fbfdeee2ed4d", size = 136799, upload-time = "2026-06-08T11:40:12.136Z" },
+    { url = "https://files.pythonhosted.org/packages/81/f5/14618b5ffd2d309cebfaa06717c2bad4a96016808ed31e463df934f758ea/vcztools-0.2.0-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:8be75be06eb249732cdbfc04f9802fa964d4e5c5a65c899c56d912c414d6998e", size = 136843, upload-time = "2026-06-08T11:40:13.391Z" },
+    { url = "https://files.pythonhosted.org/packages/81/d5/95590b3fac94972e3572b4470cb4bc2b0ae54a785ccbba82e4644c05b6c0/vcztools-0.2.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:fae2d81e12e9dfe7cf49e4799433b7b00cfb0cff1af41e152140a3e54edf5325", size = 211536, upload-time = "2026-06-08T11:40:14.794Z" },
+    { url = "https://files.pythonhosted.org/packages/c5/0e/31dc9070dcf93a0809e0c0dd9d441aa281333baece1f2a9b4fd9e51164ef/vcztools-0.2.0-cp313-cp313-win_amd64.whl", hash = "sha256:96dc5dd396414d9c074475b18dcb22659c3ebbd18c88219ddf0997613b3dfa42", size = 136223, upload-time = "2026-06-08T11:40:16.241Z" },
 ]
 
 [[package]]

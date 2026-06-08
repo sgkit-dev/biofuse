@@ -14,7 +14,7 @@ dependencies = [
   "click>=8.2.0",
   "pyfuse3>=3.4.0",
   "trio>=0.22",
-  "vcztools@git+https://github.com/sgkit-dev/vcztools.git@main",
+  "vcztools>=0.2",
 ]
 requires-python = ">=3.11"
 classifiers = [
