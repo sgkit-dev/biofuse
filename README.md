@@ -1,3 +1,6 @@
+[![CI](https://github.com/sgkit-dev/biofuse/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sgkit-dev/biofuse/actions/workflows/ci.yml)
+[![PyPI Downloads](https://static.pepy.tech/badge/biofuse)](https://pepy.tech/projects/biofuse)
+
 # biofuse
 
 Read-only views of VCF Zarr (VCZ) data in standard bioinformatics file formats
@@ -6,13 +9,11 @@ via a FUSE filesystem. Currently supported views:
 - **PLINK 1.9 binary** (`.bed` / `.bim` / `.fam`) — via `mount-plink`.
 - **Oxford BGEN** (`.bgen` / `.sample` / `.bgen.bgi`) — via `mount-bgen`.
 
-## Status
+The streaming file (`.bed` / `.bgen`) is generated on demand using the
+matching [`vcztools`](https://github.com/sgkit-dev/vcztools) encoder; the
+static sidecars are computed once at mount time.
 
-Pre-release. The mount serves the streaming file (`.bed` / `.bgen`) on
-demand via a worker subprocess running the matching
-[`vcztools`](https://github.com/sgkit-dev/vcztools) encoder
-(`BedEncoder` / `BgenEncoder`); the static sidecars are computed once
-at mount time and held in the worker's memory.
+## Supported access patterns
 
 The mounted PLINK view supports the access patterns of `plink1.9` and
 `plink2` for typical analysis commands (`--freq`, `--missing`,
@@ -23,20 +24,27 @@ in `tests/test_bgen_apps.py`.
 
 ## Install
 
-biofuse depends on libfuse 3 system headers when building from source:
+biofuse depends on libfuse 3 system headers (`pyfuse3` builds from source):
 
 ```bash
 sudo apt-get install -y fuse3 libfuse3-dev pkg-config
 ```
 
-Then with [`uv`](https://docs.astral.sh/uv/):
+Then:
 
 ```bash
-uv sync --group test
+python -m pip install biofuse      # or: uv pip install biofuse
 ```
 
-vcztools is currently consumed as a sibling-directory path dependency
-(`../vcztools`); see `pyproject.toml`.
+### Remote and zipped stores
+
+The `vcz_url` argument and the inherited `--backend-storage` /
+`--storage-option` options accept cloud, fsspec, and HTTP stores, plus
+`.vcz.zip` files. biofuse depends on bare `vcztools`; to mount cloud-backed
+stores install the matching vcztools extra, e.g.
+`pip install 'vcztools[obstore]'` or `pip install 'vcztools[icechunk]'`. See
+the [vcztools documentation](https://sgkit-dev.github.io/vcztools/) for the
+available storage backends.
 
 ## Usage
 
@@ -81,8 +89,7 @@ Mounts a read-only directory at `/mount/dir` containing
 uses zlib level 0 (stored, fixed-size variant blocks) so byte-range
 random access is O(1); downstream tools (bgenix, qctool, REGENIE,
 SAIGE, BOLT-LMM, plink2 `--bgen`) consume the mount unchanged. The
-`.bgen.bgi` SQLite sidecar is generated once at mount time and held in
-the worker's memory alongside `.sample`.
+`.bgen.bgi` SQLite sidecar and `.sample` are generated once at mount time.
 
 Options mirror `mount-plink`: `--basename`, `--access-log`, and the
 shared bcftools-style filter / backend / log set inherited from
