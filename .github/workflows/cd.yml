@@ -4,7 +4,7 @@ on:
   merge_group:
   push:
     branches:
-      - main
+      - test-publish
     tags:
       - '*'
   release:
@@ -38,6 +38,7 @@ jobs:
         with:
           name: python-package-distributions
           path: dist/
+          if-no-files-found: error
 
   publish-to-pypi:
     if: github.repository_owner == 'sgkit-dev' && github.event_name == 'release'
@@ -56,11 +57,13 @@ jobs:
       with:
         name: python-package-distributions
         path: dist/
+    - name: Show artifacts
+      run: ls -lah dist
     - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # release/v1
 
 
   publish-to-testpypi:
-    if: github.repository_owner == 'sgkit-dev' && github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
+    if: github.repository_owner == 'sgkit-dev' && github.event_name == 'push' && (github.ref_name == 'test-publish' || startsWith(github.event.ref, 'refs/tags'))
     needs:
       - packaging
     runs-on: ubuntu-latest
@@ -77,6 +80,9 @@ jobs:
       with:
         name: python-package-distributions
         path: dist/
+    - name: Show artifacts
+      run: ls -lah dist
     - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # release/v1
       with:
+        verbose: true
         repository-url: https://test.pypi.org/legacy/
