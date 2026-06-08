@@ -13,10 +13,38 @@ The streaming file (`.bed` / `.bgen`) is generated on demand using the
 matching [`vcztools`](https://github.com/sgkit-dev/vcztools) encoder; the
 static sidecars are computed once at mount time.
 
+## Stability and correctness
+
+A core design principle of biofuse is that **the mount must never become
+unresponsive**. All the work of decoding VCF Zarr and encoding it into PLINK
+or BGEN bytes is delegated to
+[vcztools](https://github.com/sgkit-dev/vcztools); biofuse itself does one
+thing — present that data as a correct, dependable read-only filesystem.
+Keeping the two responsibilities separate keeps the surface biofuse has to get
+exactly right small.
+
+- **The filesystem stays responsive under load.** Encoding runs off the
+  filesystem's request-handling path, and every read and open is bounded by a
+  timeout: a slow or stuck encode returns a normal I/O error (`EIO` /
+  `EAGAIN`) rather than blocking. One wedged file handle cannot freeze the
+  others, and unmount never hangs.
+- **Failures are contained.** An error inside the encoder surfaces to the
+  caller as an I/O error, not a crash — the mount keeps serving every other
+  file.
+- **The view is read-only and immutable.** Writes, truncation and appends are
+  rejected with `EROFS`; the sidecars are computed once when the mount starts
+  and served unchanged for its lifetime.
+- **POSIX behaviour is tested.** A dedicated filesystem test
+  harness (`fs_tests/`) exercises syscall semantics (`read` / `pread` /
+  `lseek`, `stat`, `mmap`, directory listing, write rejection), cross-checks
+  the served bytes against a reference, and runs read-stress and liveness
+  probes that confirm the mount stays responsive while the streaming file is
+  saturated.
+
 ## Performance and access patterns
 
 biofuse is optimised for **linear, sequential reads** — the access pattern
-used by the majority of downstream tools, which stream variants front-to-back.
+used by the majority of downstream tools, which stream variants start-to-end.
 The streaming `.bed` / `.bgen` file is encoded on demand as the consumer reads
 forward, and bytes already produced are buffered, so reading straight through
 the file does no redundant work. The mounts are verified against `plink1.9`
@@ -37,7 +65,8 @@ whole-file scans.
 
 The sidecar files (`.bim` / `.fam` / `.sample` / `.bgen.bgi`) are computed
 once when the mount starts, so reads of them are always fast regardless of
-access order.
+access order. These can be suppressed individually where not needed
+(e.g., the .bgen.bgi can be large and is not needed for many workloads).
 
 Because the streaming file is produced on demand, a read that stalls beyond an
 internal timeout surfaces as `EIO` rather than blocking indefinitely; in
@@ -95,6 +124,11 @@ Example:
 ```bash
 mkdir /tmp/plink-mnt
 biofuse mount-plink ./sample.vcz /tmp/plink-mnt &
+# The mount runs in the foreground, so it is backgrounded with `&`. It is
+# not ready the instant the process starts — it first opens the VCZ and
+# builds the sidecars — so wait for the mounted file to appear before
+# running the consumer tool.
+until [ -e /tmp/plink-mnt/sample.bed ]; do sleep 0.1; done
 plink1.9 --bfile /tmp/plink-mnt/sample --freq --out ./out
 fusermount3 -u /tmp/plink-mnt
 ```
@@ -122,6 +156,8 @@ Example:
 ```bash
 mkdir /tmp/bgen-mnt
 biofuse mount-bgen ./sample.vcz /tmp/bgen-mnt &
+# Wait for the mount to come up before reading from it (see mount-plink above).
+until [ -e /tmp/bgen-mnt/sample.bgen ]; do sleep 0.1; done
 bgenix -g /tmp/bgen-mnt/sample.bgen -list
 fusermount3 -u /tmp/bgen-mnt
 ```
@@ -157,6 +193,3 @@ uv run prek install                    # install git pre-commit hook (one-off)
 uv run --only-group=lint prek -c prek.toml run --all-files
 ```
 
-## Licence
-
-Apache 2.0. See `LICENSE`.
