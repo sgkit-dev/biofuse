@@ -13,14 +13,35 @@ The streaming file (`.bed` / `.bgen`) is generated on demand using the
 matching [`vcztools`](https://github.com/sgkit-dev/vcztools) encoder; the
 static sidecars are computed once at mount time.
 
-## Supported access patterns
+## Performance and access patterns
 
-The mounted PLINK view supports the access patterns of `plink1.9` and
-`plink2` for typical analysis commands (`--freq`, `--missing`,
-`--hardy`, etc.) — see `tests/test_plink_apps.py` for the verified set.
-The mounted BGEN view always uses zlib level 0 (stored, fixed-size
-blocks) for O(1) random access; `bgenix` / `qctool` parity checks live
-in `tests/test_bgen_apps.py`.
+biofuse is optimised for **linear, sequential reads** — the access pattern
+used by the majority of downstream tools, which stream variants front-to-back.
+The streaming `.bed` / `.bgen` file is encoded on demand as the consumer reads
+forward, and bytes already produced are buffered, so reading straight through
+the file does no redundant work. The mounts are verified against `plink1.9`
+and `plink2` (`--bfile`, `--freq`, `--missing`, `--hardy`, …) for PLINK, and
+`bgenix`, `qctool`, REGENIE, SAIGE, BOLT-LMM and `plink2 --bgen` for BGEN.
+
+Random and backward access still work, but are slower: seeking backwards or
+skipping far ahead can make biofuse re-encode from an earlier point in the
+file. The kernel page cache holds bytes that have already been served, so
+re-reading a region — and multi-pass tools that scan the file more than once
+(e.g. flashpca) — stays cheap once the data is warm.
+
+For BGEN, the `.bgen` payload uses zlib level 0 (stored, fixed-size variant
+blocks) together with the `.bgen.bgi` index, so a tool can fetch an individual
+variant by byte range without decompressing or re-encoding the rest of the
+file — variant-targeted access (e.g. `bgenix -v`) is efficient as well as
+whole-file scans.
+
+The sidecar files (`.bim` / `.fam` / `.sample` / `.bgen.bgi`) are computed
+once when the mount starts, so reads of them are always fast regardless of
+access order.
+
+Because the streaming file is produced on demand, a read that stalls beyond an
+internal timeout surfaces as `EIO` rather than blocking indefinitely; in
+practice this only appears under pathological random-access load.
 
 ## Install
 
